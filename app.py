@@ -1,3 +1,5 @@
+
+
 # ============================================
 # STREAMLIT APP: US Elections Explorer
 # - Years: 2016 / 2018 / 2020 / 2022 / 2024
@@ -1027,6 +1029,467 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
     geojson = json.loads(gdf.to_json())
     return geojson, gdf
 
+# ============================
+# NEW: US-wide district shapes loader
+# ============================
+
+@st.cache_data(show_spinner=True)
+def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
+    """
+    Load the Congressional district shapes for the entire US for the given year.
+    This reuses the Census cartographic boundary files defined in CD_ZIPS and
+    mirrors the state-level loader but without filtering to a single state.
+
+    Returns a GeoDataFrame with a `district_id` column and geometries as well as
+    the corresponding GeoJSON dictionary used by Plotly.  The district_id is
+    normalized to the form ``"ST-N"`` or ``"ST-AL"`` matching the rest of
+    the application.  The function caches its result to avoid re-reading
+    shapefiles on every run.
+    """
+    url = CD_ZIPS.get(year)
+    if not url:
+        raise ValueError(f"No Census district shapes configured for year={year}")
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = cache_dir / f"cd_shapes_all_{year}.zip"
+    _download_cached(url, zip_path)
+
+    # Read the entire shapefile (all states).  Using the zip:// URI allows
+    # geopandas to read directly from the compressed archive.
+    gdf = gpd.read_file(f"zip://{zip_path}")
+
+    # Identify the district number column.  The Census files include a column
+    # named CD<cycle>FP (e.g. CD118FP).  We search for the first column
+    # matching that pattern.  Fall back to any column starting with CD and
+    # ending with FP if the exact name cannot be determined.
+    cols_upper = {str(c).upper(): c for c in gdf.columns}
+    cd_candidates = []
+    for u, orig in cols_upper.items():
+        if u.startswith("CD") and u.endswith("FP"):
+            cd_candidates.append(orig)
+    if not cd_candidates:
+        cd_candidates = [c for c in gdf.columns if re.match(r"^CD\d+FP$", str(c).strip(), flags=re.I)]
+    if not cd_candidates:
+        raise ValueError(f"Could not find district FP column in US shapes. Columns: {list(gdf.columns)}")
+    cd_col = cd_candidates[0]
+
+    if "STATEFP" not in gdf.columns:
+        raise ValueError(f"Could not find STATEFP in US shapes. Columns: {list(gdf.columns)}")
+
+    # Ensure district field is zero-padded two digits and create district_id.
+    gdf[cd_col] = gdf[cd_col].astype(str).str.zfill(2)
+    # Normalize district_id using state FIPS to state abbreviation mapping.
+    def mk_id(row):
+        stfp = str(row["STATEFP"]).zfill(2)
+        state_po = FIPS_TO_STATE.get(stfp, "")
+        if not state_po:
+            return None
+        fp = row[cd_col]
+        return f"{state_po}-AL" if fp == "00" else f"{state_po}-{int(fp)}"
+
+    gdf["district_id"] = gdf.apply(mk_id, axis=1)
+    gdf = gdf[gdf["district_id"].notna()].copy()
+    gdf = gdf[gdf.geometry.notna()].copy()
+    try:
+        # Sometimes geometries can be invalid; buffer(0) is a common fix.
+        gdf["geometry"] = gdf.geometry.buffer(0)
+    except Exception:
+        pass
+    # Compute centroids (lat/lon) for each district for later distance calculations.
+    try:
+        gdf["centroid_lat"] = gdf.geometry.centroid.y
+        gdf["centroid_lon"] = gdf.geometry.centroid.x
+    except Exception:
+        gdf["centroid_lat"] = np.nan
+        gdf["centroid_lon"] = np.nan
+
+    geojson = json.loads(gdf.to_json())
+    return gdf, geojson
+
+# ============================
+# NEW: Travel map figure builder
+# ============================
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Compute the great-circle distance between two points on the earth
+    specified in decimal degrees using the haversine formula.  Returns
+    distance in kilometres.
+    """
+    try:
+        # convert decimal degrees to radians
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+        a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+        # Radius of earth in kilometres (mean radius)
+        R = 6371.0088
+        return float(R * c)
+    except Exception:
+        return float("nan")
+
+def make_travel_map_figure(
+    year: int,
+    overlay_type: str,
+    transport_mode: str,
+    time_minutes: int,
+    lat: float,
+    lon: float,
+    selected_districts: list,
+    dist_df: pd.DataFrame,
+    us_shapes: gpd.GeoDataFrame,
+    us_geojson: dict,
+    enable_acs: bool,
+):
+    """
+    Build a Plotly figure that displays Congressional districts across the US
+    coloured by either population or house margin and overlays a user-specified
+    starting point with a travel radius circle.  Districts within the travel
+    radius are highlighted, and user-selected districts are emphasised with
+    thicker borders.  Distances are computed using a simple haversine formula
+    and travel time estimates assume fixed speeds per mode.
+
+    Parameters
+    ----------
+    year : int
+        The election year (used to look up district metrics).
+    overlay_type : {"Population heatmap", "House margin"}
+        Determines which variable is used to colour the districts.
+    transport_mode : {"Driving", "Walking", "Cycling"}
+        Mode of transport used to estimate reachable distance.
+    time_minutes : int
+        Number of minutes one can travel away from the starting point.
+    lat, lon : float
+        Latitude and longitude of the user-specified starting location.
+    selected_districts : list of str
+        District identifiers (e.g. "TX-7") that the user wishes to highlight.
+    dist_df : pd.DataFrame
+        The per-district results dataframe for the chosen year (from year_data[year]["dist_df"]).
+    us_shapes : GeoDataFrame
+        The full US district shapes with centroid_lat/centroid_lon columns.
+    us_geojson : dict
+        GeoJSON representation of the US district shapes.
+    enable_acs : bool
+        Whether ACS data is available; used when overlay_type is population.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        A figure ready to be rendered by Streamlit.
+    """
+    if us_shapes.empty:
+        return go.Figure()
+    # Copy shapes to avoid modifying cached dataframe
+    gdf = us_shapes.copy()
+
+    # Determine overlay values
+    overlay_vals = pd.Series([np.nan] * len(gdf), index=gdf.index)
+    if overlay_type == "Population heatmap" and enable_acs:
+        # Map ACS total population to district shapes
+        if "acs_total_pop" in dist_df.columns:
+            pop_map = dist_df.set_index("district_id")["acs_total_pop"].to_dict()
+            overlay_vals = gdf["district_id"].map(pop_map)
+        else:
+            overlay_vals = pd.Series([np.nan] * len(gdf), index=gdf.index)
+    else:
+        # Use house margin
+        if "house_margin" in dist_df.columns:
+            hm_map = dist_df.set_index("district_id")["house_margin"].to_dict()
+            overlay_vals = gdf["district_id"].map(hm_map)
+        else:
+            overlay_vals = pd.Series([np.nan] * len(gdf), index=gdf.index)
+
+    # Normalize overlay values for plotting
+    plot_vals = safe_plot_col(overlay_vals)
+    arr = pd.to_numeric(plot_vals, errors="coerce")
+    # Colour scale selection: for population use sequential; for margin use diverging
+    if overlay_type == "Population heatmap":
+        colorscale = "YlOrRd"
+        # Set domain based on percentiles to reduce outlier skew
+        if np.isfinite(arr).any():
+            lo, hi = np.nanpercentile(arr[np.isfinite(arr)], [5, 95])
+            zmin, zmax = float(lo), float(hi)
+            if zmin == zmax:
+                zmin, zmax = (0.0, float(np.nanmax(arr))) if np.isfinite(arr).any() else (0.0, 1.0)
+        else:
+            zmin, zmax = 0.0, 1.0
+    else:
+        # House margin (Rep − Dem); negative blue, positive red
+        colorscale = "RdBu_r"
+        if np.isfinite(arr).any():
+            max_abs = float(np.nanmax(np.abs(arr.values)))
+            zmin, zmax = -max_abs, max_abs
+            if not np.isfinite(zmin) or zmax == 0:
+                zmin, zmax = -1.0, 1.0
+        else:
+            zmin, zmax = -1.0, 1.0
+
+    # Compute reachable radius in kilometres
+    speeds = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}  # mph converted to km/h
+    speed_kmh = speeds.get(transport_mode, 96.56064)
+    radius_km = float(speed_kmh) * (time_minutes / 60.0)
+
+    # Compute distances and travel times from the user-specified point
+    gdf["distance_km"] = gdf.apply(
+        lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)), axis=1
+    )
+    gdf["travel_time_hr"] = gdf["distance_km"] / speed_kmh
+    gdf["within_radius"] = gdf["distance_km"] <= radius_km
+    # Determine border colours: selected districts -> thick blue, reachable -> green, others -> light grey
+    def border_color(did, within):
+        if did in selected_districts:
+            return "#0000FF"  # blue
+        if within:
+            return "#009900"  # green
+        return "#AAAAAA"
+    def border_width(did, within):
+        if did in selected_districts:
+            return 2.5
+        if within:
+            return 1.5
+        return 0.5
+
+    # Prepare hover information: district_id, distance_km, travel_time_hr, overlay value
+    hover_id = gdf["district_id"].fillna("").astype(str)
+    hover_dist = gdf["distance_km"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "")
+    hover_time = gdf["travel_time_hr"].apply(lambda x: f"{(x*60):.0f}" if pd.notna(x) else "")  # minutes
+    hover_overlay = overlay_vals.apply(
+        lambda v: fmt_int(v) if overlay_type == "Population heatmap" else fmt_pct(v)
+    )
+    customdata = np.stack([hover_id, hover_dist, hover_time, hover_overlay], axis=1)
+
+    # Build the choropleth trace
+    choropleth = go.Choropleth(
+        geojson=us_geojson,
+        locations=gdf["district_id"],
+        featureidkey="properties.district_id",
+        z=plot_vals,
+        zmin=zmin, zmax=zmax,
+        colorscale=colorscale,
+        marker_line_color=[border_color(did, within) for did, within in zip(gdf["district_id"], gdf["within_radius"])],
+        marker_line_width=[border_width(did, within) for did, within in zip(gdf["district_id"], gdf["within_radius"])],
+        colorbar_title=("Population" if overlay_type == "Population heatmap" else "House margin (R-D)"),
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Distance: %{customdata[1]} km<br>"
+            "Travel time: %{customdata[2]} min<br>"
+            + ("Population: %{customdata[3]}" if overlay_type == "Population heatmap" else "House margin: %{customdata[3]}")
+            + "<extra></extra>"
+        ),
+        showscale=True,
+    )
+
+    # Compute circle coordinates (approximate) for the travel radius.
+    if np.isfinite(radius_km) and radius_km > 0 and np.isfinite(lat) and np.isfinite(lon):
+        num_points = 360
+        angles = np.linspace(0, 2 * np.pi, num_points)
+        # Convert km to degrees latitude/longitude (approximate):
+        deg_lat = radius_km / 111.32
+        # For longitude the scaling depends on latitude
+        deg_lon = radius_km / (111.32 * np.cos(np.radians(lat)) if np.cos(np.radians(lat)) != 0 else 1.0)
+        circle_lats = lat + deg_lat * np.sin(angles)
+        circle_lons = lon + deg_lon * np.cos(angles)
+        circle_trace = go.Scattergeo(
+            lat=circle_lats,
+            lon=circle_lons,
+            mode="lines",
+            line=dict(color="#009900", width=2),
+            name="Travel radius",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    else:
+        circle_trace = None
+
+    # Marker for starting point
+    marker_trace = go.Scattergeo(
+        lat=[lat],
+        lon=[lon],
+        mode="markers",
+        marker=dict(size=8, color="#000000", symbol="x"),
+        name="Starting point",
+        hovertext="Starting point",
+        hoverinfo="text",
+        showlegend=False,
+    )
+
+    fig = go.Figure()
+    fig.add_trace(choropleth)
+    if circle_trace is not None:
+        fig.add_trace(circle_trace)
+    fig.add_trace(marker_trace)
+    fig.update_layout(
+        title_text="US Congressional Districts — Travel Canvas",
+        geo=dict(
+            scope="usa",
+            projection_type="albers usa",
+            showland=True,
+            landcolor="rgb(243, 243, 243)",
+            subunitcolor="rgb(204, 204, 204)",
+            countrycolor="rgb(204, 204, 204)",
+            lakecolor="rgb(255, 255, 255)",
+            showlakes=True,
+            showsubunits=False,
+        ),
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=640,
+    )
+    return fig
+
+# ============================
+# NEW: Render travel canvas tab
+# ============================
+def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
+    """
+    Render the canvassing / travel map tab.  This function encapsulates
+    interactive controls for selecting a starting location, travel mode and
+    duration, choosing a colour overlay, manually highlighting districts,
+    and displaying both a map and a summary table of reachable districts.
+
+    Parameters
+    ----------
+    year : int
+        The currently selected election year.
+    year_data : dict
+        Dictionary returned from build_year_data() for all years.  This
+        function will access the per-district dataframe via year_data[year]["dist_df"].
+    enable_acs : bool
+        Whether ACS demographic data is enabled.  If true, population heatmap
+        will be available; otherwise only the House margin overlay is offered.
+    """
+    # Provide a visual divider to separate this tool from other sections
+    st.divider()
+    travel_tab = st.tabs(["Travel Map / Canvas"])[0]
+    with travel_tab:
+        st.subheader("Travel Map & District Reachability")
+        st.write(
+            """
+            Use this tool to drop a starting point anywhere in the continental United States and explore
+            which congressional districts fall within a selected travel time.  Districts are coloured
+            either by total population (via ACS data) or by the House margin (Rep − Dem) for the
+            selected year.  You can highlight specific districts manually and choose the mode of
+            transportation to adjust the travel radius.
+            """
+        )
+
+        # Choose overlay variable: population requires ACS; otherwise default to House margin
+        overlay_options = ["House margin"]
+        if enable_acs:
+            overlay_options.insert(0, "Population heatmap")
+        overlay_type = st.radio(
+            "Colour districts by", overlay_options, index=0
+        )
+
+        # Transportation mode selection
+        transport_mode = st.radio(
+            "Transportation mode", ["Driving", "Walking", "Cycling"], index=0
+        )
+        time_minutes = st.slider(
+            "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
+        )
+
+        # Starting location input
+        st.markdown("**Starting location (latitude & longitude)**")
+        col_lat, col_lon = st.columns(2)
+        with col_lat:
+            lat = st.number_input(
+                "Latitude", min_value=-90.0, max_value=90.0, value=39.5, step=0.1,
+            )
+        with col_lon:
+            lon = st.number_input(
+                "Longitude", min_value=-180.0, max_value=180.0, value=-98.35, step=0.1,
+            )
+
+        # List of all districts for multiselect
+        all_districts = (
+            year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
+        )
+        all_districts = sorted(all_districts)
+        selected_districts = st.multiselect(
+            "Districts to highlight (optional)", options=all_districts, default=[]
+        )
+
+        # Load full US district shapes for the selected year
+        try:
+            us_gdf, us_geojson = load_us_cd_shapes(year)
+        except Exception as e:
+            st.error(f"Unable to load US district shapes for year {year}.")
+            st.exception(e)
+            us_gdf, us_geojson = gpd.GeoDataFrame(), {}
+
+        # Build and display the travel map figure
+        if not us_gdf.empty:
+            fig_travel = make_travel_map_figure(
+                year,
+                overlay_type,
+                transport_mode,
+                time_minutes,
+                lat,
+                lon,
+                selected_districts,
+                year_data[year]["dist_df"],
+                us_gdf,
+                us_geojson,
+                enable_acs,
+            )
+            st.plotly_chart(fig_travel, use_container_width=True)
+
+            # Compute distances and travel times for each district to display in summary table
+            speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+            speed_kmh = speed_map.get(transport_mode, 96.56064)
+            radius_km = float(speed_kmh) * (time_minutes / 60.0)
+            temp = us_gdf[["district_id", "centroid_lat", "centroid_lon"]].copy()
+            temp["distance_km"] = temp.apply(
+                lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                axis=1,
+            )
+            temp["travel_minutes"] = (temp["distance_km"] / speed_kmh) * 60.0
+            merge_val = None
+            if overlay_type == "Population heatmap" and enable_acs and "acs_total_pop" in year_data[year]["dist_df"].columns:
+                merge_val = year_data[year]["dist_df"][["district_id", "acs_total_pop"]].copy().rename(columns={"acs_total_pop": "overlay"})
+            elif overlay_type == "House margin" and "house_margin" in year_data[year]["dist_df"].columns:
+                merge_val = year_data[year]["dist_df"][["district_id", "house_margin"]].copy().rename(columns={"house_margin": "overlay"})
+            if merge_val is not None:
+                temp = temp.merge(merge_val, on="district_id", how="left")
+            temp["within_radius"] = temp["distance_km"] <= radius_km
+            temp["selected"] = temp["district_id"].isin(selected_districts)
+            disp = temp.copy()
+            disp["Distance (km)"] = disp["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
+            disp["Travel time (min)"] = disp["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+            if overlay_type == "Population heatmap" and enable_acs:
+                disp["Population"] = disp.get("overlay", np.nan).apply(fmt_int)
+            elif overlay_type == "House margin":
+                disp["House margin (R-D)"] = disp.get("overlay", np.nan).apply(fmt_pct)
+            disp_view = disp[(disp["within_radius"] == True) | (disp["selected"] == True)].copy()
+            disp_view = disp_view.sort_values(
+                by=["selected", "within_radius", "travel_minutes"], ascending=[False, False, True]
+            )
+            cols_to_show = ["district_id", "Distance (km)", "Travel time (min)"]
+            if overlay_type == "Population heatmap" and enable_acs:
+                cols_to_show.append("Population")
+            elif overlay_type == "House margin":
+                cols_to_show.append("House margin (R-D)")
+            if not disp_view.empty:
+                st.markdown("**Reachable / Selected districts**")
+                st.dataframe(
+                    disp_view[cols_to_show].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                    use_container_width=True,
+                    height=320,
+                )
+            else:
+                st.info(
+                    "No districts fall within the selected travel radius. Adjust the starting point, time or mode to explore more districts."
+                )
+        else:
+            st.info("US-wide shapes could not be loaded; travel map is unavailable.")
+    # end of legacy travel code
+
+# After rendering all other sections, display the interactive travel canvas tab.
+render_travel_canvas(year, year_data, enable_acs)
+
 # ----------------------------
 # BUILD ALL YEAR DATA ONCE
 # ----------------------------
@@ -1805,3 +2268,140 @@ else:
         "District shapes are cached locally. "
         "ACS is disabled."
     )
+
+    # Legacy Travel Canvas implementation retained for backward compatibility.
+    # This block is disabled because a newer travel canvas implementation is provided later.
+    # If you wish to restore the legacy canvassing tool, set the condition below to True.
+    if False:
+        # -------------------------------------------------------------
+        # Travel Canvas / Canvassing tool
+        # -------------------------------------------------------------
+        st.divider()
+        # Introduce a new tab specifically for the canvassing/travel map.
+        travel_tab = st.tabs(["Travel Map / Canvas"])[0]
+        with travel_tab:
+            st.subheader("Travel Map & District Reachability")
+            st.write(
+                """
+                Use this tool to drop a starting point anywhere in the continental United States and explore
+                which congressional districts fall within a selected travel time.  Districts are coloured
+                either by total population (via ACS data) or by the House margin (Rep − Dem) for the
+                selected year.  You can highlight specific districts manually and choose the mode of
+                transportation to adjust the travel radius.
+                """
+            )
+
+            # Overlay selection: population or house margin
+            overlay_type = st.radio(
+                "Colour districts by", ["Population heatmap", "House margin"], index=0
+            )
+            # Transportation mode and corresponding speed definitions
+            transport_mode = st.radio(
+                "Transportation mode", ["Driving", "Walking", "Cycling"], index=0
+            )
+            time_minutes = st.slider(
+                "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
+            )
+
+            # Location input – default to approximate center of the contiguous US
+            st.markdown("**Starting location (latitude & longitude)**")
+            col_lat, col_lon = st.columns(2)
+            with col_lat:
+                lat = st.number_input(
+                    "Latitude", min_value=-90.0, max_value=90.0, value=39.5, step=0.1,
+                )
+            with col_lon:
+                lon = st.number_input(
+                    "Longitude", min_value=-180.0, max_value=180.0, value=-98.35, step=0.1,
+                )
+
+            # Allow users to manually highlight districts
+            all_districts = (
+                year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
+            )
+            all_districts = sorted(all_districts)
+            selected_districts = st.multiselect(
+                "Districts to highlight (optional)", options=all_districts, default=[]
+            )
+
+            # Load US-wide district shapes once for the selected year
+            try:
+                us_gdf, us_geojson = load_us_cd_shapes(year)
+            except Exception as e:
+                st.error(f"Unable to load US district shapes for year {year}.")
+                st.exception(e)
+                us_gdf, us_geojson = gpd.GeoDataFrame(), {}
+
+            # Build and display the travel map figure
+            if not us_gdf.empty:
+                fig_travel = make_travel_map_figure(
+                    year,
+                    overlay_type,
+                    transport_mode,
+                    time_minutes,
+                    lat,
+                    lon,
+                    selected_districts,
+                    year_data[year]["dist_df"],
+                    us_gdf,
+                    us_geojson,
+                    enable_acs,
+                )
+                st.plotly_chart(fig_travel, use_container_width=True)
+
+                # Compute distances and travel times for each district and present a summary table
+                # Use the same speed definitions as the figure function
+                speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+                speed_kmh = speed_map.get(transport_mode, 96.56064)
+                radius_km = float(speed_kmh) * (time_minutes / 60.0)
+                # Prepare a dataframe with centroids and distances
+                temp = us_gdf[["district_id", "centroid_lat", "centroid_lon"]].copy()
+                temp["distance_km"] = temp.apply(
+                    lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                    axis=1,
+                )
+                temp["travel_minutes"] = (temp["distance_km"] / speed_kmh) * 60.0
+                # Merge overlay value for display
+                merge_val = None
+                if overlay_type == "Population heatmap" and enable_acs and "acs_total_pop" in year_data[year]["dist_df"].columns:
+                    merge_val = year_data[year]["dist_df"][["district_id", "acs_total_pop"]].copy().rename(columns={"acs_total_pop": "overlay"})
+                elif overlay_type == "House margin" and "house_margin" in year_data[year]["dist_df"].columns:
+                    merge_val = year_data[year]["dist_df"][["district_id", "house_margin"]].copy().rename(columns={"house_margin": "overlay"})
+                if merge_val is not None:
+                    temp = temp.merge(merge_val, on="district_id", how="left")
+                # Identify reachable and/or selected districts
+                temp["within_radius"] = temp["distance_km"] <= radius_km
+                temp["selected"] = temp["district_id"].isin(selected_districts)
+                # Format columns for display
+                disp = temp.copy()
+                disp["Distance (km)"] = disp["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
+                disp["Travel time (min)"] = disp["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+                if overlay_type == "Population heatmap" and enable_acs:
+                    disp["Population"] = disp["overlay"].apply(fmt_int)
+                elif overlay_type == "House margin":
+                    disp["House margin (R-D)"] = disp["overlay"].apply(fmt_pct)
+                # Filter to reachable districts or selected districts for brevity
+                disp_view = disp[(disp["within_radius"] == True) | (disp["selected"] == True)].copy()
+                # Sort: selected first, then by travel time
+                disp_view = disp_view.sort_values(
+                    by=["selected", "within_radius", "travel_minutes"], ascending=[False, False, True]
+                )
+                # Columns to show
+                cols_to_show = ["district_id", "Distance (km)", "Travel time (min)"]
+                if overlay_type == "Population heatmap" and enable_acs:
+                    cols_to_show.append("Population")
+                elif overlay_type == "House margin":
+                    cols_to_show.append("House margin (R-D)")
+                if not disp_view.empty:
+                    st.markdown("**Reachable / Selected districts**")
+                    st.dataframe(
+                        disp_view[cols_to_show].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                        use_container_width=True,
+                        height=320,
+                    )
+                else:
+                    st.info(
+                        "No districts fall within the selected travel radius. Adjust the starting point, time or mode to explore more districts."
+                    )
+            else:
+                st.info("US-wide shapes could not be loaded; travel map is unavailable.")
