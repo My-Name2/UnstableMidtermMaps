@@ -1486,8 +1486,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             st.info("US-wide shapes could not be loaded; travel map is unavailable.")
     # end of legacy travel code
 
-# After rendering all other sections, display the interactive travel canvas tab.
-render_travel_canvas(year, year_data, enable_acs)
+# The Travel Map / Canvas tab is rendered later, once `year` and `year_data` have been defined.
+# (The call below has been moved to after the input data is loaded.)
 
 # ----------------------------
 # BUILD ALL YEAR DATA ONCE
@@ -1856,6 +1856,9 @@ except Exception as e:
     st.error("Failed to load/parse your input files. Check the paths and file formats.")
     st.exception(e)
     st.stop()
+
+# After successfully loading inputs and caching year_data, render the Travel Map / Canvas tab.
+render_travel_canvas(year, year_data, enable_acs)
 
 if enable_acs:
     st.sidebar.caption(f"ACS: requested {acs_requested_year} • used {acs_used_year} • tried {acs_tried}")
