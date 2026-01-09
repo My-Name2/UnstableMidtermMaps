@@ -1,4 +1,5 @@
 
+
 # ============================================
 # STREAMLIT APP: US Elections Explorer
 # - Years: 2016 / 2018 / 2020 / 2022 / 2024
@@ -62,6 +63,19 @@ CD_ZIPS = {
     2022: "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_cd118_500k.zip",
     2024: "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_cd118_500k.zip",
 }
+
+# ----------------------------
+# COUNTY SHAPES (Census cartographic boundary)
+#
+# For more granular analyses than congressional districts we may wish to
+# colour the travel map by county-level population.  This file path
+# points to the Census cartographic boundary shapefile for all US
+# counties at a 1:500k resolution.  The ZIP archive contains a
+# shapefile with columns STATEFP and COUNTYFP which can be joined to
+# ACS estimates via five-digit FIPS codes.  See
+# https://www2.census.gov/geo/tiger/GENZ2023/shp/ for details on the
+# available boundary files.
+COUNTY_ZIP_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_500k.zip"
 
 STATE_FIPS = {
     "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09","DE":"10","DC":"11","FL":"12","GA":"13",
@@ -606,6 +620,69 @@ ACS_OUTPUT_COLS = [
     "acs_pct_veteran",
 ]
 
+# Mapping of ACS variables to user-friendly labels for the travel table.
+# These names will be used when displaying ACS demographic columns in the
+# travel summary and aggregated statistics.  We keep the labels short and
+# intuitive for readability.
+ACS_LABELS = {
+    "acs_total_pop": "Population",
+    "acs_pct_male": "% male",
+    "acs_pct_female": "% female",
+    "acs_median_age": "Median age",
+    "acs_pct_white_alone": "% White (alone)",
+    "acs_pct_black_alone": "% Black (alone)",
+    "acs_pct_asian_alone": "% Asian (alone)",
+    "acs_pct_hispanic": "% Hispanic",
+    "acs_median_hh_income": "Median HH income",
+    "acs_pct_bachelors_or_higher": "% Bachelor+ (25+)",
+    "acs_pct_veteran": "% veteran (18+)",
+}
+
+# ----------------------------
+# Geocoding helper
+#
+# When a user enters a place name (city, address, or ZIP code) in the travel
+# canvas search box we need to translate that text into latitude and longitude
+# coordinates.  We use the Nominatim API from OpenStreetMap because it is
+# public and does not require an API key.  If the search yields results we
+# return a (lat, lon) tuple; otherwise we return None.  We send a minimal
+# User‑Agent header to be polite to the service.
+def geocode_location(query: str):
+    """
+    Geocode a location string into latitude and longitude via Nominatim.
+
+    Parameters
+    ----------
+    query : str
+        The free‑form location string (e.g., "Houston, TX", "10001", "1600
+        Pennsylvania Ave Washington DC").
+
+    Returns
+    -------
+    tuple of float or None
+        A pair (lat, lon) if the place is found, otherwise None.
+    """
+    if not query:
+        return None
+    try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": query, "format": "json", "limit": 1}
+        # Nominatim requires a valid User‑Agent; reuse our UA where possible
+        headers = {"User-Agent": UA.get("User-Agent", "election-explorer")}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if not j:
+            return None
+        # Parse the first result
+        lat = float(j[0].get("lat", 0.0))
+        lon = float(j[0].get("lon", 0.0))
+        return (lat, lon)
+    except Exception:
+        # Any exception (network, parsing) results in no coordinates
+        return None
+
 def _census_get(url: str, timeout=40):
     r = requests.get(url, headers=UA, timeout=timeout)
     if r.status_code != 200:
@@ -1107,6 +1184,117 @@ def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
     return gdf, geojson
 
 # ============================
+# NEW: County shapes loader and ACS population loader
+# ============================
+
+@st.cache_data(show_spinner=True)
+def load_us_county_shapes(cache_dir: str = "county_shapes_cache"):
+    """
+    Download and load the cartographic boundary shapefile for all US counties.
+    The file is cached locally to avoid repeated downloads.  Each county is
+    assigned a `county_id` equal to its 5‑digit FIPS code (state FIPS
+    concatenated with county FIPS).  Centroid latitude and longitude are
+    computed for distance calculations.  A GeoJSON dictionary is also
+    returned for use with Plotly.
+
+    Parameters
+    ----------
+    cache_dir : str, optional
+        Directory to store the cached ZIP file and extracted data.
+
+    Returns
+    -------
+    (GeoDataFrame, dict)
+        A GeoDataFrame with columns `county_id`, `statefp`, `countyfp`,
+        `state_po`, `county_name`, `centroid_lat`, `centroid_lon`, and
+        the geometry.  The accompanying GeoJSON dict can be passed to
+        Plotly for rendering.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = cache_dir / "county_shapes_all.zip"
+    _download_cached(COUNTY_ZIP_URL, zip_path)
+    # Read shapefile directly from the ZIP archive
+    gdf = gpd.read_file(f"zip://{zip_path}")
+    # Validate required columns
+    if "STATEFP" not in gdf.columns or "COUNTYFP" not in gdf.columns:
+        raise ValueError(f"County shapefile missing STATEFP/COUNTYFP columns: {list(gdf.columns)}")
+    # Build FIPS codes and identifiers
+    gdf["statefp"] = gdf["STATEFP"].astype(str).str.zfill(2)
+    gdf["countyfp"] = gdf["COUNTYFP"].astype(str).str.zfill(3)
+    gdf["county_id"] = gdf["statefp"] + gdf["countyfp"]
+    # Map state abbreviation for hover labels
+    gdf["state_po"] = gdf["statefp"].map(FIPS_TO_STATE).fillna("")
+    gdf["county_name"] = gdf.get("NAME", "").astype(str)
+    # Ensure valid geometries
+    try:
+        gdf["geometry"] = gdf.geometry.buffer(0)
+    except Exception:
+        pass
+    # Compute centroids (lat/lon) for travel calculations
+    try:
+        gdf["centroid_lat"] = gdf.geometry.centroid.y
+        gdf["centroid_lon"] = gdf.geometry.centroid.x
+    except Exception:
+        gdf["centroid_lat"] = np.nan
+        gdf["centroid_lon"] = np.nan
+    # Prepare GeoJSON representation
+    geojson = json.loads(gdf.to_json())
+    return gdf, geojson
+
+
+@st.cache_data(show_spinner=True)
+def load_county_population(acs_year: int, api_key: str | None = None):
+    """
+    Fetch ACS 5‑year total population estimates for all counties for a given
+    year.  We request both the estimate (B01003_001E) and the associated
+    margin of error (B01003_001M).  Results are returned as a DataFrame
+    keyed by the county's 5‑digit FIPS code.
+
+    Parameters
+    ----------
+    acs_year : int
+        The ending year of the ACS 5‑year period (e.g. 2023 for the
+        2019–2023 ACS release).  If a data set for the requested year is
+        unavailable the request may raise an exception.
+    api_key : str or None, optional
+        A Census API key.  If omitted the anonymous quota will be used.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: county_id, state, county, total_pop, total_pop_moe, acs_year.
+    """
+    # Build API URL and parameters
+    vars_ = ["B01003_001E", "B01003_001M"]
+    get_params = ",".join(vars_)
+    base_url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5"
+    params = {
+        "get": get_params,
+        "for": "county:*",
+        "in": "state:*",
+    }
+    if api_key:
+        params["key"] = api_key
+    # Perform request
+    resp = requests.get(base_url, params=params, headers=UA, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data or len(data) < 2:
+        raise ValueError(f"No data returned for ACS year {acs_year}")
+    header = data[0]
+    rows = data[1:]
+    df = pd.DataFrame(rows, columns=header)
+    # Ensure zero padding
+    df["state"] = df["state"].astype(str).str.zfill(2)
+    df["county"] = df["county"].astype(str).str.zfill(3)
+    df["county_id"] = df["state"] + df["county"]
+    df["total_pop"] = pd.to_numeric(df["B01003_001E"], errors="coerce")
+    df["total_pop_moe"] = pd.to_numeric(df["B01003_001M"], errors="coerce")
+    df["acs_year"] = acs_year
+    return df[["county_id", "state", "county", "total_pop", "total_pop_moe", "acs_year"]]
+
+# ============================
 # NEW: Travel map figure builder
 # ============================
 
@@ -1338,6 +1526,150 @@ def make_travel_map_figure(
     )
     return fig
 
+
+# ============================
+# NEW: County travel map figure builder
+# ============================
+
+def make_county_travel_map_figure(
+    overlay_type: str,
+    transport_mode: str,
+    time_minutes: int,
+    lat: float,
+    lon: float,
+    county_df: gpd.GeoDataFrame,
+    county_geojson: dict,
+):
+    """
+    Build a Plotly figure for county-level travel canvassing.  Counties are
+    coloured by their total population, and a travel radius circle is drawn
+    around the specified starting point.  Distances are computed using a
+    simple haversine formula.  This function is invoked when the user selects
+    the "County population heatmap" overlay option.
+
+    Parameters
+    ----------
+    overlay_type : str
+        Currently unused; retained for API symmetry with make_travel_map_figure.
+    transport_mode : {"Driving", "Walking", "Cycling"}
+        Mode of transport used to estimate reachable distance.
+    time_minutes : int
+        Number of minutes one can travel away from the starting point.
+    lat, lon : float
+        Latitude and longitude of the user-specified starting location.
+    county_df : GeoDataFrame
+        GeoDataFrame of counties with columns `county_id`, `total_pop`,
+        `centroid_lat`, `centroid_lon`, and geometry.
+    county_geojson : dict
+        GeoJSON representation of the county shapes.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        A figure ready to be rendered by Streamlit.
+    """
+    if county_df.empty:
+        return go.Figure()
+    gdf = county_df.copy()
+    # Overlay values: total population
+    overlay_vals = gdf.get("total_pop", pd.Series([np.nan] * len(gdf), index=gdf.index))
+    plot_vals = safe_plot_col(overlay_vals)
+    arr = pd.to_numeric(plot_vals, errors="coerce")
+    # Colour scale and domain
+    colorscale = "YlOrRd"
+    if np.isfinite(arr).any():
+        lo, hi = np.nanpercentile(arr[np.isfinite(arr)], [5, 95])
+        zmin, zmax = float(lo), float(hi)
+        if zmin == zmax:
+            zmin, zmax = (0.0, float(np.nanmax(arr))) if np.isfinite(arr).any() else (0.0, 1.0)
+    else:
+        zmin, zmax = 0.0, 1.0
+    # Compute reachable radius in kilometres
+    speeds = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+    speed_kmh = speeds.get(transport_mode, 96.56064)
+    radius_km = float(speed_kmh) * (time_minutes / 60.0)
+    # Distances
+    gdf["distance_km"] = gdf.apply(
+        lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)), axis=1
+    )
+    gdf["within_radius"] = gdf["distance_km"] <= radius_km
+    # Hover info: county name, state, distance and population
+    hover_id = gdf.apply(lambda r: f"{r.get('county_name','')}, {r.get('state_po','')}", axis=1)
+    hover_dist = gdf["distance_km"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "")
+    hover_pop = gdf["total_pop"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+    customdata = np.stack([hover_id, hover_dist, hover_pop], axis=1)
+    choropleth = go.Choropleth(
+        geojson=county_geojson,
+        locations=gdf["county_id"],
+        featureidkey="properties.county_id",
+        z=plot_vals,
+        zmin=zmin,
+        zmax=zmax,
+        colorscale=colorscale,
+        marker_line_color="#BBBBBB",
+        marker_line_width=0.2,
+        colorbar_title="Population",
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Distance: %{customdata[1]} km<br>"
+            "Population: %{customdata[2]}"
+            "<extra></extra>"
+        ),
+        showscale=True,
+    )
+    # Circle and marker traces
+    if np.isfinite(radius_km) and radius_km > 0 and np.isfinite(lat) and np.isfinite(lon):
+        num_points = 360
+        angles = np.linspace(0, 2 * np.pi, num_points)
+        deg_lat = radius_km / 111.32
+        deg_lon = radius_km / (111.32 * np.cos(np.radians(lat)) if np.cos(np.radians(lat)) != 0 else 1.0)
+        circle_lats = lat + deg_lat * np.sin(angles)
+        circle_lons = lon + deg_lon * np.cos(angles)
+        circle_trace = go.Scattergeo(
+            lat=circle_lats,
+            lon=circle_lons,
+            mode="lines",
+            line=dict(color="#009900", width=2),
+            name="Travel radius",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    else:
+        circle_trace = None
+    marker_trace = go.Scattergeo(
+        lat=[lat],
+        lon=[lon],
+        mode="markers",
+        marker=dict(size=8, color="#000000", symbol="x"),
+        name="Starting point",
+        hovertext="Starting point",
+        hoverinfo="text",
+        showlegend=False,
+    )
+    fig = go.Figure()
+    fig.add_trace(choropleth)
+    if circle_trace is not None:
+        fig.add_trace(circle_trace)
+    fig.add_trace(marker_trace)
+    fig.update_layout(
+        title_text="US Counties — Travel Canvas",
+        geo=dict(
+            scope="usa",
+            projection_type="albers usa",
+            showland=True,
+            landcolor="rgb(243, 243, 243)",
+            subunitcolor="rgb(204, 204, 204)",
+            countrycolor="rgb(204, 204, 204)",
+            lakecolor="rgb(255, 255, 255)",
+            showlakes=True,
+            showsubunits=False,
+        ),
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=640,
+    )
+    return fig
+
 # ============================
 # NEW: Render travel canvas tab
 # ============================
@@ -1374,12 +1706,19 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             """
         )
 
-        # Choose overlay variable: population requires ACS; otherwise default to House margin
+        # Choose overlay variable.  When ACS data are enabled we offer both
+        # district-level and county-level population overlays; otherwise only
+        # House margin is available.
         overlay_options = ["House margin"]
         if enable_acs:
+            # District-level population uses the ACS congressional district profile
             overlay_options.insert(0, "Population heatmap")
+            # County-level population provides a more granular view of the ACS 5‑year
+            # total population estimates for all counties
+            overlay_options.insert(0, "County population heatmap")
+        # Use a neutral label since not all overlays apply strictly to districts
         overlay_type = st.radio(
-            "Colour districts by", overlay_options, index=0
+            "Colour by", overlay_options, index=0
         )
 
         # Transportation mode selection
@@ -1390,17 +1729,52 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
         )
 
-        # Starting location input
+        # Starting location selection
+        # Use Streamlit session state to persist the chosen starting location across
+        # reruns.  If not yet defined, initialize to a default central US point.
+        if "travel_lat" not in st.session_state:
+            st.session_state["travel_lat"] = 39.5
+        if "travel_lon" not in st.session_state:
+            st.session_state["travel_lon"] = -98.35
+
+        # Location search: allow users to enter a city/address/ZIP and geocode it
+        st.markdown("**Find a location**")
+        search_query = st.text_input(
+            "Search by city, address, or ZIP code",
+            key="travel_location_search",
+            placeholder="e.g. Houston, TX or 10001"
+        )
+        if st.button("Search and set location", key="travel_search_button"):
+            coords = geocode_location(search_query)
+            if coords:
+                st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
+            else:
+                st.warning("Could not find that location. Please try a different search term.")
+
+        # Starting location numeric inputs.  These are pre‑filled from session state
+        # and update the session state whenever edited.
         st.markdown("**Starting location (latitude & longitude)**")
         col_lat, col_lon = st.columns(2)
         with col_lat:
             lat = st.number_input(
-                "Latitude", min_value=-90.0, max_value=90.0, value=39.5, step=0.1,
+                "Latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                value=float(st.session_state.get("travel_lat", 39.5)),
+                step=0.1,
+                key="travel_lat_input"
             )
+            st.session_state["travel_lat"] = float(lat)
         with col_lon:
             lon = st.number_input(
-                "Longitude", min_value=-180.0, max_value=180.0, value=-98.35, step=0.1,
+                "Longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                value=float(st.session_state.get("travel_lon", -98.35)),
+                step=0.1,
+                key="travel_lon_input"
             )
+            st.session_state["travel_lon"] = float(lon)
 
         # List of all districts for multiselect
         all_districts = (
@@ -1410,6 +1784,82 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         selected_districts = st.multiselect(
             "Districts to highlight (optional)", options=all_districts, default=[]
         )
+
+        # If the user has selected the county-level population overlay, handle
+        # the map and summary here and return early.  This avoids loading
+        # congressional district shapes and reuses a more granular ACS
+        # population estimate joined to county boundaries.  We call
+        # load_us_county_shapes() and load_county_population() to fetch
+        # shapefiles and ACS estimates, build a choropleth map via
+        # make_county_travel_map_figure() and display a table of reachable
+        # counties along with aggregated totals.  If any step fails an
+        # exception will be shown.
+        if overlay_type == "County population heatmap" and enable_acs:
+            try:
+                county_shapes, county_geojson = load_us_county_shapes()
+                # Use the newest available ACS 5‑year population estimate.  Try 2023 first,
+                # then fall back to 2022 if necessary.  A Census API key is optional.
+                try:
+                    county_pop = load_county_population(2023, None)
+                except Exception:
+                    county_pop = load_county_population(2022, None)
+                county_df = county_shapes.merge(
+                    county_pop[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
+                )
+                fig_county = make_county_travel_map_figure(
+                    overlay_type,
+                    transport_mode,
+                    time_minutes,
+                    lat,
+                    lon,
+                    county_df,
+                    county_geojson,
+                )
+                st.plotly_chart(fig_county, use_container_width=True)
+                # Prepare summary table for reachable counties
+                speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+                speed_kmh = speed_map.get(transport_mode, 96.56064)
+                radius_km = float(speed_kmh) * (time_minutes / 60.0)
+                temp_c = county_df[[
+                    "county_id", "county_name", "state_po", "centroid_lat", "centroid_lon", "total_pop", "total_pop_moe"
+                ]].copy()
+                temp_c["distance_km"] = temp_c.apply(
+                    lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                    axis=1,
+                )
+                temp_c["travel_minutes"] = (temp_c["distance_km"] / speed_kmh) * 60.0
+                temp_c["within_radius"] = temp_c["distance_km"] <= radius_km
+                disp_c = temp_c[temp_c["within_radius"] == True].copy()
+                # Format readable columns
+                disp_c["County"] = disp_c.apply(lambda r: f"{r['county_name']}, {r['state_po']}", axis=1)
+                disp_c["Distance (km)"] = disp_c["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
+                disp_c["Travel time (min)"] = disp_c["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+                disp_c["Population"] = disp_c["total_pop"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+                disp_c["Population MOE"] = disp_c["total_pop_moe"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+                cols = ["County", "Distance (km)", "Travel time (min)", "Population", "Population MOE"]
+                if not disp_c.empty:
+                    disp_c = disp_c.sort_values("travel_minutes")
+                    st.markdown("**Reachable counties**")
+                    st.dataframe(disp_c[cols].reset_index(drop=True), use_container_width=True, height=320)
+                # Aggregated statistics for reachable counties
+                reach_pop_total = temp_c.loc[temp_c["within_radius"] == True, "total_pop"].sum(skipna=True)
+                reach_moe_total = np.sqrt(
+                    np.square(
+                        temp_c.loc[temp_c["within_radius"] == True, "total_pop_moe"].astype(float)
+                    ).sum(skipna=True)
+                ) if ("total_pop_moe" in temp_c.columns and not temp_c["total_pop_moe"].isna().all()) else np.nan
+                if pd.notna(reach_pop_total) and reach_pop_total > 0:
+                    agg_metrics = {"Total population": fmt_int(reach_pop_total)}
+                    if pd.notna(reach_moe_total):
+                        agg_metrics["Margin of error"] = fmt_int(reach_moe_total)
+                    st.markdown("**Aggregated population of reachable counties**")
+                    agg_df_c = pd.DataFrame([agg_metrics])
+                    st.dataframe(agg_df_c, use_container_width=True, height=100)
+            except Exception as e:
+                st.error("Unable to load county population data.")
+                st.exception(e)
+            # Exit early to avoid the district-level overlay logic
+            return
 
         # Load full US district shapes for the selected year
         try:
@@ -1447,30 +1897,69 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             )
             temp["travel_minutes"] = (temp["distance_km"] / speed_kmh) * 60.0
             merge_val = None
+            # Prepare overlay value for map and table based on selected overlay type
             if overlay_type == "Population heatmap" and enable_acs and "acs_total_pop" in year_data[year]["dist_df"].columns:
                 merge_val = year_data[year]["dist_df"][["district_id", "acs_total_pop"]].copy().rename(columns={"acs_total_pop": "overlay"})
             elif overlay_type == "House margin" and "house_margin" in year_data[year]["dist_df"].columns:
                 merge_val = year_data[year]["dist_df"][["district_id", "house_margin"]].copy().rename(columns={"house_margin": "overlay"})
             if merge_val is not None:
                 temp = temp.merge(merge_val, on="district_id", how="left")
+
+            # If ACS data is enabled attach all ACS columns so that the summary table can display them
+            if enable_acs:
+                available_acs_cols = [c for c in ACS_OUTPUT_COLS if c in year_data[year]["dist_df"].columns]
+                if available_acs_cols:
+                    acs_subset = year_data[year]["dist_df"][["district_id"] + available_acs_cols].copy()
+                    temp = temp.merge(acs_subset, on="district_id", how="left")
+
+            # Flags for reachability and selection
             temp["within_radius"] = temp["distance_km"] <= radius_km
             temp["selected"] = temp["district_id"].isin(selected_districts)
+
             disp = temp.copy()
+            # Human readable distance and time strings
             disp["Distance (km)"] = disp["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
             disp["Travel time (min)"] = disp["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+
+            # Overlay value formatting
             if overlay_type == "Population heatmap" and enable_acs:
-                disp["Population"] = disp.get("overlay", np.nan).apply(fmt_int)
+                disp["Population"] = disp.get("overlay", np.nan).apply(lambda v: fmt_int(v) if pd.notna(v) else "")
             elif overlay_type == "House margin":
-                disp["House margin (R-D)"] = disp.get("overlay", np.nan).apply(fmt_pct)
+                disp["House margin (R-D)"] = disp.get("overlay", np.nan).apply(lambda v: fmt_pct(v) if pd.notna(v) else "")
+
+            # Format ACS columns into human friendly strings when available
+            if enable_acs:
+                for c in [col for col in ACS_OUTPUT_COLS if col in disp.columns]:
+                    label = ACS_LABELS.get(c, c)
+                    if c == "acs_total_pop":
+                        disp[label] = disp[c].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+                    elif c == "acs_median_hh_income":
+                        disp[label] = disp[c].apply(lambda v: fmt_money(v) if pd.notna(v) else "")
+                    elif c == "acs_median_age":
+                        disp[label] = disp[c].apply(lambda v: f"{float(v):.1f}" if pd.notna(v) else "")
+                    else:
+                        # Percentages
+                        disp[label] = disp[c].apply(lambda v: fmt_pct(v) if pd.notna(v) else "")
+
+            # Create the subset of rows to display: either reachable or selected
             disp_view = disp[(disp["within_radius"] == True) | (disp["selected"] == True)].copy()
             disp_view = disp_view.sort_values(
                 by=["selected", "within_radius", "travel_minutes"], ascending=[False, False, True]
             )
+
+            # Columns to show in summary
             cols_to_show = ["district_id", "Distance (km)", "Travel time (min)"]
             if overlay_type == "Population heatmap" and enable_acs:
                 cols_to_show.append("Population")
             elif overlay_type == "House margin":
                 cols_to_show.append("House margin (R-D)")
+            # Append formatted ACS labels
+            if enable_acs:
+                for c in [col for col in ACS_OUTPUT_COLS if col in disp.columns]:
+                    label = ACS_LABELS.get(c, c)
+                    if label not in cols_to_show:
+                        cols_to_show.append(label)
+
             if not disp_view.empty:
                 st.markdown("**Reachable / Selected districts**")
                 st.dataframe(
@@ -1478,6 +1967,40 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     use_container_width=True,
                     height=320,
                 )
+
+            # Show aggregated ACS statistics for reachable districts
+            if enable_acs:
+                # Identify reachable records in temp (numeric columns available)
+                reach_df = temp[temp["within_radius"] == True].copy()
+                if not reach_df.empty:
+                    acs_cols_present = [c for c in ACS_OUTPUT_COLS if c in reach_df.columns]
+                    # Compute total reachable population; if zero or NaN skip aggregation
+                    total_pop_reach = reach_df.get("acs_total_pop", pd.Series(dtype=float)).sum(skipna=True)
+                    if pd.notna(total_pop_reach) and total_pop_reach > 0:
+                        agg_metrics = {}
+                        for c in acs_cols_present:
+                            label = ACS_LABELS.get(c, c)
+                            if c == "acs_total_pop":
+                                # Total population of reachable area
+                                agg_metrics[label] = fmt_int(total_pop_reach)
+                            elif c == "acs_median_hh_income":
+                                # Weighted average of median household income
+                                num = (reach_df[c] * reach_df["acs_total_pop"]).sum(skipna=True)
+                                val = num / total_pop_reach if pd.notna(num) else np.nan
+                                agg_metrics[f"Avg {label}"] = fmt_money(val) if pd.notna(val) else ""
+                            elif c == "acs_median_age":
+                                num = (reach_df[c] * reach_df["acs_total_pop"]).sum(skipna=True)
+                                val = num / total_pop_reach if pd.notna(num) else np.nan
+                                agg_metrics[f"Avg {label}"] = f"{float(val):.1f}" if pd.notna(val) else ""
+                            else:
+                                # Weighted percentages
+                                num = (reach_df[c] * reach_df["acs_total_pop"]).sum(skipna=True)
+                                val = num / total_pop_reach if pd.notna(num) else np.nan
+                                agg_metrics[f"Avg {label}"] = fmt_pct(val) if pd.notna(val) else ""
+                        st.markdown("**Aggregated ACS demographics of reachable districts**")
+                        # Convert metrics dict to a single‑row DataFrame for display
+                        agg_df = pd.DataFrame([agg_metrics])
+                        st.dataframe(agg_df, use_container_width=True, height=min(200, 100 + 20 * len(agg_df.columns)))
             else:
                 st.info(
                     "No districts fall within the selected travel radius. Adjust the starting point, time or mode to explore more districts."
