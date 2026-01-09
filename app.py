@@ -1167,6 +1167,14 @@ def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
     gdf["district_id"] = gdf.apply(mk_id, axis=1)
     gdf = gdf[gdf["district_id"].notna()].copy()
     gdf = gdf[gdf.geometry.notna()].copy()
+    # Compute a 4‑digit FIPS code for each congressional district (state FIPS
+    # concatenated with the two‑digit district code).  This will be used
+    # when displaying FIPS codes in the travel map summary.  Both STATEFP
+    # and the district code column are zero‑padded strings at this point.
+    try:
+        gdf["district_fips"] = gdf["STATEFP"].astype(str).str.zfill(2) + gdf[cd_col].astype(str).str.zfill(2)
+    except Exception:
+        gdf["district_fips"] = ""
     try:
         # Sometimes geometries can be invalid; buffer(0) is a common fix.
         gdf["geometry"] = gdf.geometry.buffer(0)
@@ -1671,6 +1679,285 @@ def make_county_travel_map_figure(
     return fig
 
 # ============================
+# NEW: Combined county + district travel map figure
+# ============================
+
+def make_county_district_combined_map(
+    overlay_type: str,
+    transport_mode: str,
+    time_minutes: int,
+    lat: float,
+    lon: float,
+    county_df: gpd.GeoDataFrame,
+    county_geojson: dict,
+    district_gdf: gpd.GeoDataFrame,
+    district_geojson: dict,
+    selected_districts: list[str],
+):
+    """
+    Build a Plotly figure that overlays county‑level population choropleth
+    with congressional district boundaries.  Counties are coloured by their
+    total population estimate from the ACS 5‑year dataset.  District
+    boundaries are drawn on top: all districts are shown with thin grey
+    outlines while any user‑selected districts are highlighted with a
+    semi‑transparent fill and thicker border.  A travel radius circle and
+    starting point marker are also drawn.
+
+    This function is used when the user chooses the "County population
+    heatmap" overlay while still desiring to see congressional district
+    boundaries and highlight selections.  It mirrors the behaviour of
+    make_county_travel_map_figure() but augments the map with an extra
+    layer for district boundaries.
+
+    Parameters
+    ----------
+    overlay_type : str
+        Unused; retained for API symmetry.
+    transport_mode : {"Driving", "Walking", "Cycling"}
+        Mode of travel; determines reachable distance.
+    time_minutes : int
+        Travel duration in minutes.
+    lat, lon : float
+        Coordinates of the user‑specified starting point.
+    county_df : GeoDataFrame
+        Counties with columns `county_id`, `total_pop`, `centroid_lat`,
+        `centroid_lon` and geometry.
+    county_geojson : dict
+        GeoJSON representation of counties.
+    district_gdf : GeoDataFrame
+        Congressional districts with columns `district_id`, `district_fips`,
+        `centroid_lat`, `centroid_lon` and geometry.
+    district_geojson : dict
+        GeoJSON representation of districts.
+    selected_districts : list[str]
+        District identifiers selected by the user for highlighting.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Figure overlaying county population with district boundaries.
+    """
+    # Guard: if county or district data is missing, return empty figure
+    if county_df.empty or district_gdf.empty:
+        return go.Figure()
+    gdf_county = county_df.copy()
+    gdf_dist = district_gdf.copy()
+    # Compute speed and radius
+    speeds = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+    speed_kmh = speeds.get(transport_mode, 96.56064)
+    radius_km = float(speed_kmh) * (time_minutes / 60.0)
+    # Compute distances and reachable flag for counties
+    gdf_county["distance_km"] = gdf_county.apply(
+        lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)), axis=1
+    )
+    gdf_county["within_radius"] = gdf_county["distance_km"] <= radius_km
+    # Colour scale for county population
+    overlay_vals = gdf_county.get("total_pop", pd.Series([np.nan] * len(gdf_county), index=gdf_county.index))
+    plot_vals = safe_plot_col(overlay_vals)
+    arr = pd.to_numeric(plot_vals, errors="coerce")
+    colorscale = "YlOrRd"
+    if np.isfinite(arr).any():
+        lo, hi = np.nanpercentile(arr[np.isfinite(arr)], [5, 95])
+        zmin, zmax = float(lo), float(hi)
+        if zmin == zmax:
+            zmin, zmax = (0.0, float(np.nanmax(arr))) if np.isfinite(arr).any() else (0.0, 1.0)
+    else:
+        zmin, zmax = 0.0, 1.0
+    # Prepare county hover information
+    hover_id = gdf_county.apply(lambda r: f"{r.get('county_name','')}, {r.get('state_po','')}", axis=1)
+    hover_dist = gdf_county["distance_km"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "")
+    hover_pop = gdf_county["total_pop"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+    customdata_c = np.stack([hover_id, hover_dist, hover_pop], axis=1)
+    # County choropleth trace
+    county_trace = go.Choropleth(
+        geojson=county_geojson,
+        locations=gdf_county["county_id"],
+        featureidkey="properties.county_id",
+        z=plot_vals,
+        zmin=zmin,
+        zmax=zmax,
+        colorscale=colorscale,
+        marker_line_color="#BBBBBB",
+        marker_line_width=0.25,
+        colorbar_title="Population",
+        customdata=customdata_c,
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Distance: %{customdata[1]} km<br>"
+            "Population: %{customdata[2]}"
+            "<extra></extra>"
+        ),
+        showscale=True,
+    )
+    # District boundaries: base layer (all districts) with thin grey outlines, no fill
+    # We assign a constant z value (0) and an empty colorscale to suppress fill.
+    base_z = [0] * len(gdf_dist)
+    base_trace = go.Choropleth(
+        geojson=district_geojson,
+        locations=gdf_dist["district_id"],
+        featureidkey="properties.district_id",
+        z=base_z,
+        colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,0,0)"]],
+        showscale=False,
+        marker_line_color="#666666",
+        marker_line_width=0.5,
+        hoverinfo="skip",
+        name="Districts",
+    )
+    # Highlight layer for selected districts: semi‑transparent fill and thicker outlines
+    selected_mask = gdf_dist["district_id"].isin(selected_districts)
+    selected_df = gdf_dist[selected_mask].copy()
+    if not selected_df.empty:
+        sel_z = [1] * len(selected_df)
+        highlight_trace = go.Choropleth(
+            geojson=district_geojson,
+            locations=selected_df["district_id"],
+            featureidkey="properties.district_id",
+            z=sel_z,
+            colorscale=[[0, "rgba(0,0,0,0)"], [1, "rgba(0,0,255,0.25)"]],
+            showscale=False,
+            marker_line_color="#003399",
+            marker_line_width=2.0,
+            hoverinfo="skip",
+            name="Selected districts",
+        )
+    else:
+        highlight_trace = None
+    # Travel radius circle
+    if np.isfinite(radius_km) and radius_km > 0 and np.isfinite(lat) and np.isfinite(lon):
+        num_points = 360
+        angles = np.linspace(0, 2 * np.pi, num_points)
+        deg_lat = radius_km / 111.32
+        deg_lon = radius_km / (111.32 * np.cos(np.radians(lat)) if np.cos(np.radians(lat)) != 0 else 1.0)
+        circle_lats = lat + deg_lat * np.sin(angles)
+        circle_lons = lon + deg_lon * np.cos(angles)
+        circle_trace = go.Scattergeo(
+            lat=circle_lats,
+            lon=circle_lons,
+            mode="lines",
+            line=dict(color="#009900", width=2),
+            name="Travel radius",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    else:
+        circle_trace = None
+    # Starting point marker
+    marker_trace = go.Scattergeo(
+        lat=[lat],
+        lon=[lon],
+        mode="markers",
+        marker=dict(size=8, color="#000000", symbol="x"),
+        name="Starting point",
+        hovertext="Starting point",
+        hoverinfo="text",
+        showlegend=False,
+    )
+    # Assemble figure
+    fig = go.Figure()
+    fig.add_trace(county_trace)
+    fig.add_trace(base_trace)
+    if highlight_trace is not None:
+        fig.add_trace(highlight_trace)
+    if circle_trace is not None:
+        fig.add_trace(circle_trace)
+    fig.add_trace(marker_trace)
+    fig.update_layout(
+        title_text="US Counties & Congressional Districts — Travel Canvas",
+        geo=dict(
+            scope="usa",
+            projection_type="albers usa",
+            showland=True,
+            landcolor="rgb(243, 243, 243)",
+            subunitcolor="rgb(204, 204, 204)",
+            countrycolor="rgb(204, 204, 204)",
+            lakecolor="rgb(255, 255, 255)",
+            showlakes=True,
+            showsubunits=False,
+        ),
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=640,
+    )
+    return fig
+
+# ============================
+# NEW: Mapping from selected districts to containing counties
+# ============================
+def compute_district_county_mapping(
+    selected_districts: list[str],
+    district_gdf: gpd.GeoDataFrame,
+    county_df: gpd.GeoDataFrame,
+) -> pd.DataFrame:
+    """
+    For each selected congressional district compute the list of county FIPS codes
+    (five‑digit identifiers) whose geometries intersect with that district.  The
+    mapping is returned as a DataFrame with columns: `district_id`,
+    `district_fips` and `county_fips_list`.  If a district does not intersect
+    any counties (which is highly unlikely) it will be omitted from the
+    results.
+
+    Parameters
+    ----------
+    selected_districts : list[str]
+        District identifiers to map.
+    district_gdf : GeoDataFrame
+        GeoDataFrame containing districts with `district_id`, `district_fips`
+        and geometry columns.
+    county_df : GeoDataFrame
+        GeoDataFrame of counties with `county_id` and geometry columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame with one row per selected district, including its
+        identifier, FIPS code and a comma‑separated list of county FIPS
+        codes contained within the district.
+    """
+    rows: list[dict] = []
+    if not selected_districts or district_gdf.empty or county_df.empty:
+        return pd.DataFrame(columns=["district_id", "district_fips", "county_fips_list"])
+    # Attempt to build a spatial index on county geometries to speed up
+    # bounding box queries; if unavailable shapely will handle it gracefully.
+    try:
+        county_sindex = county_df.sindex
+    except Exception:
+        county_sindex = None
+    for dist_id in selected_districts:
+        try:
+            # Look up the district geometry and FIPS code
+            idxs = district_gdf.index[district_gdf["district_id"] == dist_id]
+            if len(idxs) == 0:
+                continue
+            idx = idxs[0]
+            d_geom = district_gdf.loc[idx, "geometry"]
+            d_fips = district_gdf.loc[idx, "district_fips"] if "district_fips" in district_gdf.columns else ""
+            if d_geom is None or d_geom.is_empty:
+                continue
+            # Identify candidate counties via bounding box intersection if an index exists
+            if county_sindex is not None:
+                possible = list(county_sindex.intersection(d_geom.bounds))
+                subset = county_df.iloc[possible]
+            else:
+                subset = county_df
+            # Perform precise geometric intersection test
+            intersecting = subset[subset.geometry.intersects(d_geom)]
+            if intersecting.empty:
+                counties_str = ""
+            else:
+                county_ids = intersecting["county_id"].astype(str).tolist()
+                county_ids_sorted = sorted(county_ids)
+                counties_str = ", ".join(county_ids_sorted)
+            rows.append({
+                "district_id": dist_id,
+                "district_fips": d_fips,
+                "county_fips_list": counties_str
+            })
+        except Exception:
+            # Skip districts on failure
+            continue
+    return pd.DataFrame(rows)
+
+# ============================
 # NEW: Render travel canvas tab
 # ============================
 def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
@@ -1785,20 +2072,17 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             "Districts to highlight (optional)", options=all_districts, default=[]
         )
 
-        # If the user has selected the county-level population overlay, handle
-        # the map and summary here and return early.  This avoids loading
-        # congressional district shapes and reuses a more granular ACS
-        # population estimate joined to county boundaries.  We call
-        # load_us_county_shapes() and load_county_population() to fetch
-        # shapefiles and ACS estimates, build a choropleth map via
-        # make_county_travel_map_figure() and display a table of reachable
-        # counties along with aggregated totals.  If any step fails an
-        # exception will be shown.
+        # If the user has selected the county-level population overlay, build a combined
+        # map that overlays counties and district boundaries.  In addition to the
+        # county summary we will also compute a summary for districts within the
+        # travel radius and highlight selections.  Early return after
+        # handling this branch prevents the legacy district-only overlay logic from
+        # running.
         if overlay_type == "County population heatmap" and enable_acs:
             try:
+                # Load county shapes and population estimates
                 county_shapes, county_geojson = load_us_county_shapes()
-                # Use the newest available ACS 5‑year population estimate.  Try 2023 first,
-                # then fall back to 2022 if necessary.  A Census API key is optional.
+                # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
                 try:
                     county_pop = load_county_population(2023, None)
                 except Exception:
@@ -1806,7 +2090,10 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 county_df = county_shapes.merge(
                     county_pop[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
                 )
-                fig_county = make_county_travel_map_figure(
+                # Load district shapes for overlay boundaries and FIPS codes
+                us_gdf, us_geojson = load_us_cd_shapes(year)
+                # Build combined map with highlighted districts
+                fig_combined = make_county_district_combined_map(
                     overlay_type,
                     transport_mode,
                     time_minutes,
@@ -1814,9 +2101,12 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     lon,
                     county_df,
                     county_geojson,
+                    us_gdf,
+                    us_geojson,
+                    selected_districts,
                 )
-                st.plotly_chart(fig_county, use_container_width=True)
-                # Prepare summary table for reachable counties
+                st.plotly_chart(fig_combined, use_container_width=True)
+                # ----- County summary -----
                 speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
                 speed_kmh = speed_map.get(transport_mode, 96.56064)
                 radius_km = float(speed_kmh) * (time_minutes / 60.0)
@@ -1841,7 +2131,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     disp_c = disp_c.sort_values("travel_minutes")
                     st.markdown("**Reachable counties**")
                     st.dataframe(disp_c[cols].reset_index(drop=True), use_container_width=True, height=320)
-                # Aggregated statistics for reachable counties
+                # Aggregated population for reachable counties
                 reach_pop_total = temp_c.loc[temp_c["within_radius"] == True, "total_pop"].sum(skipna=True)
                 reach_moe_total = np.sqrt(
                     np.square(
@@ -1855,10 +2145,43 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     st.markdown("**Aggregated population of reachable counties**")
                     agg_df_c = pd.DataFrame([agg_metrics])
                     st.dataframe(agg_df_c, use_container_width=True, height=100)
+                # ----- District summary -----
+                # Compute travel distances for all districts
+                temp_d = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
+                temp_d["distance_km"] = temp_d.apply(
+                    lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                    axis=1,
+                )
+                temp_d["travel_minutes"] = (temp_d["distance_km"] / speed_kmh) * 60.0
+                temp_d["within_radius"] = temp_d["distance_km"] <= radius_km
+                temp_d["selected"] = temp_d["district_id"].isin(selected_districts)
+                disp_d = temp_d[(temp_d["within_radius"] == True) | (temp_d["selected"] == True)].copy()
+                # Format display columns
+                disp_d["Distance (km)"] = disp_d["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
+                disp_d["Travel time (min)"] = disp_d["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
+                cols_d = ["district_id", "district_fips", "Distance (km)", "Travel time (min)"]
+                disp_d = disp_d.sort_values(by=["selected", "within_radius", "travel_minutes"], ascending=[False, False, True])
+                if not disp_d.empty:
+                    st.markdown("**Reachable / Selected districts**")
+                    st.dataframe(
+                        disp_d[cols_d].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
+                        use_container_width=True,
+                        height=320,
+                    )
+                # Mapping of selected districts to counties contained within them
+                if selected_districts:
+                    mapping_df = compute_district_county_mapping(selected_districts, us_gdf, county_df)
+                    if not mapping_df.empty:
+                        st.markdown("**Counties contained within selected districts**")
+                        st.dataframe(
+                            mapping_df.rename(columns={"district_id": "District", "district_fips": "District FIPS", "county_fips_list": "County FIPS codes"}).reset_index(drop=True),
+                            use_container_width=True,
+                            height=200,
+                        )
             except Exception as e:
-                st.error("Unable to load county population data.")
+                st.error("Unable to load county population or district data.")
                 st.exception(e)
-            # Exit early to avoid the district-level overlay logic
+            # Exit early after handling the combined county/district overlay
             return
 
         # Load full US district shapes for the selected year
@@ -1890,7 +2213,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
             speed_kmh = speed_map.get(transport_mode, 96.56064)
             radius_km = float(speed_kmh) * (time_minutes / 60.0)
-            temp = us_gdf[["district_id", "centroid_lat", "centroid_lon"]].copy()
+            # Include district FIPS for display in summary tables
+            temp = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
             temp["distance_km"] = temp.apply(
                 lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
                 axis=1,
@@ -1948,7 +2272,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             )
 
             # Columns to show in summary
-            cols_to_show = ["district_id", "Distance (km)", "Travel time (min)"]
+            cols_to_show = ["district_id", "district_fips", "Distance (km)", "Travel time (min)"]
             if overlay_type == "Population heatmap" and enable_acs:
                 cols_to_show.append("Population")
             elif overlay_type == "House margin":
@@ -1963,7 +2287,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             if not disp_view.empty:
                 st.markdown("**Reachable / Selected districts**")
                 st.dataframe(
-                    disp_view[cols_to_show].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                    disp_view[cols_to_show].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
                     use_container_width=True,
                     height=320,
                 )
