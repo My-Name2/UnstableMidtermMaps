@@ -2063,30 +2063,14 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             )
             st.session_state["travel_lon"] = float(lon)
 
-        # List of all districts for multiselect.  To avoid reloading the map on every
-        # selection change, we separate the currently selected values from those
-        # actually submitted for highlighting.  Users can pick multiple districts
-        # and then click the "Update selected districts" button to refresh the
-        # highlights.  The map will only redraw when this button is pressed.
+        # List of all districts for multiselect
         all_districts = (
             year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
         )
         all_districts = sorted(all_districts)
-        # Initialize submitted selection in session state if not present
-        if "selected_districts_submitted" not in st.session_state:
-            st.session_state["selected_districts_submitted"] = []
-        # Show multiselect with current submitted selections as default
-        current_selected = st.multiselect(
-            "Districts to highlight (optional)", options=all_districts,
-            default=st.session_state.get("selected_districts_submitted", [])
+        selected_districts = st.multiselect(
+            "Districts to highlight (optional)", options=all_districts, default=[]
         )
-        # Button to commit the current selections; this prevents map from redrawing on
-        # every change of the multiselect.  When pressed, the selected districts
-        # become active for highlighting and the map will update.
-        if st.button("Update selected districts", key="update_districts_button"):
-            st.session_state["selected_districts_submitted"] = list(current_selected)
-        # Use the submitted selection for all downstream logic
-        selected_districts = st.session_state.get("selected_districts_submitted", [])
 
         # If the user has selected the county-level population overlay, build a combined
         # map that overlays counties and district boundaries.  In addition to the
@@ -2096,49 +2080,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         # running.
         if overlay_type == "County population heatmap" and enable_acs:
             try:
-                # Determine whether to recompute the heavy county/district map.  If the
-                # cached parameters differ or no cached figure exists, rebuild.
-                needs_recompute = (
-                    "travel_last_params" not in st.session_state
-                    or st.session_state.get("travel_last_params") != current_params
-                    or st.session_state.get("travel_is_county") is not True
-                )
-                if needs_recompute:
-                    county_shapes_fig, county_geojson_fig = load_us_county_shapes()
-                    # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
-                    try:
-                        county_pop_fig = load_county_population(2023, None)
-                    except Exception:
-                        county_pop_fig = load_county_population(2022, None)
-                    county_df_fig = county_shapes_fig.merge(
-                        county_pop_fig[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
-                    )
-                    # Load district shapes for overlay boundaries and FIPS codes
-                    us_gdf_fig, us_geojson_fig = load_us_cd_shapes(year)
-                    # Build combined map with highlighted districts
-                    fig_new = make_county_district_combined_map(
-                        overlay_type,
-                        transport_mode,
-                        time_minutes,
-                        lat,
-                        lon,
-                        county_df_fig,
-                        county_geojson_fig,
-                        us_gdf_fig,
-                        us_geojson_fig,
-                        selected_districts,
-                    )
-                    # Store the new figure and parameters in session state
-                    st.session_state["travel_fig"] = fig_new
-                    st.session_state["travel_last_params"] = current_params
-                    st.session_state["travel_is_county"] = True
-                # Retrieve cached (or newly created) figure
-                fig_combined = st.session_state.get("travel_fig")
-                st.plotly_chart(fig_combined, width='stretch')
-                # Compute county and district dataframes for summary on each run.
-                # This ensures summary reflects the current starting location even
-                # when the map figure is cached from a previous run.
+                # Load county shapes and population estimates
                 county_shapes, county_geojson = load_us_county_shapes()
+                # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
                 try:
                     county_pop = load_county_population(2023, None)
                 except Exception:
@@ -2146,7 +2090,22 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 county_df = county_shapes.merge(
                     county_pop[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
                 )
+                # Load district shapes for overlay boundaries and FIPS codes
                 us_gdf, us_geojson = load_us_cd_shapes(year)
+                # Build combined map with highlighted districts
+                fig_combined = make_county_district_combined_map(
+                    overlay_type,
+                    transport_mode,
+                    time_minutes,
+                    lat,
+                    lon,
+                    county_df,
+                    county_geojson,
+                    us_gdf,
+                    us_geojson,
+                    selected_districts,
+                )
+                st.plotly_chart(fig_combined, use_container_width=True)
                 # ----- County summary -----
                 speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
                 speed_kmh = speed_map.get(transport_mode, 96.56064)
@@ -2171,7 +2130,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 if not disp_c.empty:
                     disp_c = disp_c.sort_values("travel_minutes")
                     st.markdown("**Reachable counties**")
-                    st.dataframe(disp_c[cols].reset_index(drop=True), width='stretch', height=320)
+                    st.dataframe(disp_c[cols].reset_index(drop=True), use_container_width=True, height=320)
                 # Aggregated population for reachable counties
                 reach_pop_total = temp_c.loc[temp_c["within_radius"] == True, "total_pop"].sum(skipna=True)
                 reach_moe_total = np.sqrt(
@@ -2185,7 +2144,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                         agg_metrics["Margin of error"] = fmt_int(reach_moe_total)
                     st.markdown("**Aggregated population of reachable counties**")
                     agg_df_c = pd.DataFrame([agg_metrics])
-                    st.dataframe(agg_df_c, width='stretch', height=100)
+                    st.dataframe(agg_df_c, use_container_width=True, height=100)
                 # ----- District summary -----
                 # Compute travel distances for all districts
                 temp_d = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
@@ -2206,7 +2165,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     st.markdown("**Reachable / Selected districts**")
                     st.dataframe(
                         disp_d[cols_d].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
-                        width='stretch',
+                        use_container_width=True,
                         height=320,
                     )
                 # Mapping of selected districts to counties contained within them
@@ -2216,7 +2175,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                         st.markdown("**Counties contained within selected districts**")
                         st.dataframe(
                             mapping_df.rename(columns={"district_id": "District", "district_fips": "District FIPS", "county_fips_list": "County FIPS codes"}).reset_index(drop=True),
-                            width='stretch',
+                            use_container_width=True,
                             height=200,
                         )
             except Exception as e:
@@ -2235,33 +2194,20 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
 
         # Build and display the travel map figure
         if not us_gdf.empty:
-            # Determine whether to recompute the district-only travel map.  If the
-            # cached parameters differ or if the previous overlay was county-level,
-            # rebuild the map.  Otherwise reuse the cached figure.
-            needs_recompute = (
-                "travel_last_params" not in st.session_state
-                or st.session_state.get("travel_last_params") != current_params
-                or st.session_state.get("travel_is_county") is True
+            fig_travel = make_travel_map_figure(
+                year,
+                overlay_type,
+                transport_mode,
+                time_minutes,
+                lat,
+                lon,
+                selected_districts,
+                year_data[year]["dist_df"],
+                us_gdf,
+                us_geojson,
+                enable_acs,
             )
-            if needs_recompute:
-                fig_new = make_travel_map_figure(
-                    year,
-                    overlay_type,
-                    transport_mode,
-                    time_minutes,
-                    lat,
-                    lon,
-                    selected_districts,
-                    year_data[year]["dist_df"],
-                    us_gdf,
-                    us_geojson,
-                    enable_acs,
-                )
-                st.session_state["travel_fig"] = fig_new
-                st.session_state["travel_last_params"] = current_params
-                st.session_state["travel_is_county"] = False
-            fig_travel = st.session_state.get("travel_fig")
-            st.plotly_chart(fig_travel, width='stretch')
+            st.plotly_chart(fig_travel, use_container_width=True)
 
             # Compute distances and travel times for each district to display in summary table
             speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
@@ -2342,7 +2288,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 st.markdown("**Reachable / Selected districts**")
                 st.dataframe(
                     disp_view[cols_to_show].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
-                    width='stretch',
+                    use_container_width=True,
                     height=320,
                 )
 
@@ -2378,7 +2324,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                         st.markdown("**Aggregated ACS demographics of reachable districts**")
                         # Convert metrics dict to a single‑row DataFrame for display
                         agg_df = pd.DataFrame([agg_metrics])
-                        st.dataframe(agg_df, width='stretch', height=min(200, 100 + 20 * len(agg_df.columns)))
+                        st.dataframe(agg_df, use_container_width=True, height=min(200, 100 + 20 * len(agg_df.columns)))
             else:
                 st.info(
                     "No districts fall within the selected travel radius. Adjust the starting point, time or mode to explore more districts."
@@ -2789,7 +2735,7 @@ left, right = st.columns([1.15, 1.0], gap="large")
 with left:
     st.subheader("State map")
     fig = make_state_map_figure(sdf, year, metric_col)
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True)
 
 with right:
     st.subheader(f"{state_po} summary ({year})")
@@ -2878,7 +2824,7 @@ sub["rep_pct_all_str"] = sub.get("rep_pct_all", np.nan).map(fmt_pct)
 
 try:
     fig2 = make_district_map_figure(state_po, year, sub, spend_measure, (enable_acs and include_acs_in_hover))
-    st.plotly_chart(fig2, width='stretch')
+    st.plotly_chart(fig2, use_container_width=True)
 except Exception as e:
     st.warning("District map unavailable (could not load Census district shapes or plot them).")
     st.exception(e)
@@ -2964,7 +2910,7 @@ rename_map = {
     "acs_pct_veteran": "ACS % veteran (18+)",
 }
 show = show.rename(columns=rename_map)
-st.dataframe(show, width='stretch', height=420)
+st.dataframe(show, use_container_width=True, height=420)
 
 st.subheader("Toss-ups (filtered to this state)")
 if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
@@ -2999,7 +2945,7 @@ if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
                 if pc in st_toss_disp.columns:
                     st_toss_disp[pc] = st_toss_disp[pc].map(fmt_pct)
 
-        st.dataframe(st_toss_disp, width='stretch', height=260)
+        st.dataframe(st_toss_disp, use_container_width=True, height=260)
 else:
     st.info("No toss-up table available (ratings scrape returned no districts).")
 
@@ -3144,7 +3090,7 @@ else:
         "acs_pct_veteran": "ACS % veteran (18+)",
     }
 
-    st.dataframe(view[show_cols].rename(columns=rename), width='stretch', height=520)
+    st.dataframe(view[show_cols].rename(columns=rename), use_container_width=True, height=520)
 
 # ----------------------------
 # Notes / warnings
@@ -3223,19 +3169,9 @@ else:
                 year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
             )
             all_districts = sorted(all_districts)
-            # Manual highlight for districts in this section: allow selecting multiple
-            # districts without immediately redrawing the map.  Use session state to
-            # persist the submitted highlights.  A separate button commits the
-            # selection to the map.
-            if "selected_districts_submitted" not in st.session_state:
-                st.session_state["selected_districts_submitted"] = []
-            current_selected2 = st.multiselect(
-                "Districts to highlight (optional)", options=all_districts,
-                default=st.session_state.get("selected_districts_submitted", [])
+            selected_districts = st.multiselect(
+                "Districts to highlight (optional)", options=all_districts, default=[]
             )
-            if st.button("Update selected districts", key="update_districts_button_alt"):
-                st.session_state["selected_districts_submitted"] = list(current_selected2)
-            selected_districts = st.session_state.get("selected_districts_submitted", [])
 
             # Load US-wide district shapes once for the selected year
             try:
@@ -3260,7 +3196,7 @@ else:
                     us_geojson,
                     enable_acs,
                 )
-                st.plotly_chart(fig_travel, width='stretch')
+                st.plotly_chart(fig_travel, use_container_width=True)
 
                 # Compute distances and travel times for each district and present a summary table
                 # Use the same speed definitions as the figure function
@@ -3268,8 +3204,7 @@ else:
                 speed_kmh = speed_map.get(transport_mode, 96.56064)
                 radius_km = float(speed_kmh) * (time_minutes / 60.0)
                 # Prepare a dataframe with centroids and distances
-                # Include district FIPS in the summary for readability
-                temp = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
+                temp = us_gdf[["district_id", "centroid_lat", "centroid_lon"]].copy()
                 temp["distance_km"] = temp.apply(
                     lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
                     axis=1,
@@ -3301,7 +3236,7 @@ else:
                     by=["selected", "within_radius", "travel_minutes"], ascending=[False, False, True]
                 )
                 # Columns to show
-                cols_to_show = ["district_id", "district_fips", "Distance (km)", "Travel time (min)"]
+                cols_to_show = ["district_id", "Distance (km)", "Travel time (min)"]
                 if overlay_type == "Population heatmap" and enable_acs:
                     cols_to_show.append("Population")
                 elif overlay_type == "House margin":
@@ -3309,8 +3244,8 @@ else:
                 if not disp_view.empty:
                     st.markdown("**Reachable / Selected districts**")
                     st.dataframe(
-                        disp_view[cols_to_show].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
-                        width='stretch',
+                        disp_view[cols_to_show].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                        use_container_width=True,
                         height=320,
                     )
                 else:
