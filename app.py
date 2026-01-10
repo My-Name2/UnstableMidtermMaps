@@ -2096,9 +2096,49 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         # running.
         if overlay_type == "County population heatmap" and enable_acs:
             try:
-                # Load county shapes and population estimates
+                # Determine whether to recompute the heavy county/district map.  If the
+                # cached parameters differ or no cached figure exists, rebuild.
+                needs_recompute = (
+                    "travel_last_params" not in st.session_state
+                    or st.session_state.get("travel_last_params") != current_params
+                    or st.session_state.get("travel_is_county") is not True
+                )
+                if needs_recompute:
+                    county_shapes_fig, county_geojson_fig = load_us_county_shapes()
+                    # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
+                    try:
+                        county_pop_fig = load_county_population(2023, None)
+                    except Exception:
+                        county_pop_fig = load_county_population(2022, None)
+                    county_df_fig = county_shapes_fig.merge(
+                        county_pop_fig[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
+                    )
+                    # Load district shapes for overlay boundaries and FIPS codes
+                    us_gdf_fig, us_geojson_fig = load_us_cd_shapes(year)
+                    # Build combined map with highlighted districts
+                    fig_new = make_county_district_combined_map(
+                        overlay_type,
+                        transport_mode,
+                        time_minutes,
+                        lat,
+                        lon,
+                        county_df_fig,
+                        county_geojson_fig,
+                        us_gdf_fig,
+                        us_geojson_fig,
+                        selected_districts,
+                    )
+                    # Store the new figure and parameters in session state
+                    st.session_state["travel_fig"] = fig_new
+                    st.session_state["travel_last_params"] = current_params
+                    st.session_state["travel_is_county"] = True
+                # Retrieve cached (or newly created) figure
+                fig_combined = st.session_state.get("travel_fig")
+                st.plotly_chart(fig_combined, width='stretch')
+                # Compute county and district dataframes for summary on each run.
+                # This ensures summary reflects the current starting location even
+                # when the map figure is cached from a previous run.
                 county_shapes, county_geojson = load_us_county_shapes()
-                # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
                 try:
                     county_pop = load_county_population(2023, None)
                 except Exception:
@@ -2106,22 +2146,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 county_df = county_shapes.merge(
                     county_pop[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
                 )
-                # Load district shapes for overlay boundaries and FIPS codes
                 us_gdf, us_geojson = load_us_cd_shapes(year)
-                # Build combined map with highlighted districts
-                fig_combined = make_county_district_combined_map(
-                    overlay_type,
-                    transport_mode,
-                    time_minutes,
-                    lat,
-                    lon,
-                    county_df,
-                    county_geojson,
-                    us_gdf,
-                    us_geojson,
-                    selected_districts,
-                )
-                st.plotly_chart(fig_combined, width='stretch')
                 # ----- County summary -----
                 speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
                 speed_kmh = speed_map.get(transport_mode, 96.56064)
@@ -2210,19 +2235,32 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
 
         # Build and display the travel map figure
         if not us_gdf.empty:
-            fig_travel = make_travel_map_figure(
-                year,
-                overlay_type,
-                transport_mode,
-                time_minutes,
-                lat,
-                lon,
-                selected_districts,
-                year_data[year]["dist_df"],
-                us_gdf,
-                us_geojson,
-                enable_acs,
+            # Determine whether to recompute the district-only travel map.  If the
+            # cached parameters differ or if the previous overlay was county-level,
+            # rebuild the map.  Otherwise reuse the cached figure.
+            needs_recompute = (
+                "travel_last_params" not in st.session_state
+                or st.session_state.get("travel_last_params") != current_params
+                or st.session_state.get("travel_is_county") is True
             )
+            if needs_recompute:
+                fig_new = make_travel_map_figure(
+                    year,
+                    overlay_type,
+                    transport_mode,
+                    time_minutes,
+                    lat,
+                    lon,
+                    selected_districts,
+                    year_data[year]["dist_df"],
+                    us_gdf,
+                    us_geojson,
+                    enable_acs,
+                )
+                st.session_state["travel_fig"] = fig_new
+                st.session_state["travel_last_params"] = current_params
+                st.session_state["travel_is_county"] = False
+            fig_travel = st.session_state.get("travel_fig")
             st.plotly_chart(fig_travel, width='stretch')
 
             # Compute distances and travel times for each district to display in summary table
