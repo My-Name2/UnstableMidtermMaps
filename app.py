@@ -2119,10 +2119,24 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         current_lon = st.session_state.get("travel_lon", -98.35)
         is_listening = st.session_state.get("listening_for_click", False)
         
+        # Look up the county name for the current location
+        current_county_display = ""
+        try:
+            county_shapes_for_lookup, _ = load_us_county_shapes()
+            if not county_shapes_for_lookup.empty and "geometry" in county_shapes_for_lookup.columns:
+                from shapely.geometry import Point
+                current_point = Point(current_lon, current_lat)
+                for idx, row in county_shapes_for_lookup.iterrows():
+                    if row["geometry"] is not None and row["geometry"].contains(current_point):
+                        current_county_display = f" — **{row['county_name']}, {row['state_po']}**"
+                        break
+        except Exception:
+            pass
+        
         if is_listening:
             st.warning("👆 **Click anywhere on the map below to set your starting location!**")
         else:
-            st.caption(f"📍 Current location: ({current_lat:.4f}, {current_lon:.4f})")
+            st.success(f"📍 Current location: ({current_lat:.4f}, {current_lon:.4f}){current_county_display}")
         
         # Use current session state values
         lat = current_lat
@@ -2443,12 +2457,38 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     popup=f"{time_minutes} min {transport_mode.lower()} radius"
                 ).add_to(m)
                 
+                # Find which county the starting point is in
+                starting_county_name = ""
+                try:
+                    county_shapes_lookup, _ = load_us_county_shapes()
+                    if not county_shapes_lookup.empty and "geometry" in county_shapes_lookup.columns:
+                        from shapely.geometry import Point
+                        start_point = Point(lon, lat)
+                        # Find the county containing this point
+                        for idx, row in county_shapes_lookup.iterrows():
+                            if row["geometry"] is not None and row["geometry"].contains(start_point):
+                                starting_county_name = f"{row['county_name']}, {row['state_po']}"
+                                break
+                except Exception:
+                    pass
+                
                 # Add starting point marker
                 folium.Marker(
                     [lat, lon],
-                    popup=f"Start: ({lat:.4f}, {lon:.4f})",
+                    popup=f"Start: ({lat:.4f}, {lon:.4f})" + (f"<br>{starting_county_name}" if starting_county_name else ""),
                     icon=folium.Icon(color="green", icon="star")
                 ).add_to(m)
+                
+                # Add county name label below the marker
+                if starting_county_name:
+                    folium.Marker(
+                        [lat - 0.15, lon],  # Slightly below the marker
+                        icon=folium.DivIcon(
+                            html=f'<div style="font-size: 12px; font-weight: bold; color: #006400; background: rgba(255,255,255,0.85); padding: 3px 8px; border-radius: 4px; border: 1px solid #009900; white-space: nowrap; text-align: center;">📍 {starting_county_name}</div>',
+                            icon_size=(200, 30),
+                            icon_anchor=(100, 0)
+                        )
+                    ).add_to(m)
                 
                 # Add colormap legend
                 if colormap:
