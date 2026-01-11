@@ -2068,9 +2068,60 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
         )
         all_districts = sorted(all_districts)
-        selected_districts = st.multiselect(
-            "Districts to highlight (optional)", options=all_districts, default=[]
+
+        # ----------------------------------------------------------------
+        # BATCH DISTRICT SELECTION: Use session state to store pending and
+        # confirmed selections so the map only reloads when user clicks
+        # "Load Selected Districts" rather than on every multiselect change.
+        # ----------------------------------------------------------------
+        if "pending_districts" not in st.session_state:
+            st.session_state["pending_districts"] = []
+        if "confirmed_districts" not in st.session_state:
+            st.session_state["confirmed_districts"] = []
+
+        st.markdown("**Select districts to highlight**")
+        st.caption(
+            "Add districts below, then click 'Load Selected Districts' to update the map. "
+            "This prevents the map from reloading after each selection."
         )
+
+        # Use on_change callback to update pending_districts without triggering map reload
+        def update_pending():
+            st.session_state["pending_districts"] = st.session_state.get("district_picker", [])
+
+        # The multiselect updates pending_districts via callback but map uses confirmed_districts
+        st.multiselect(
+            "Districts to highlight (select multiple, then click Load)",
+            options=all_districts,
+            default=st.session_state.get("pending_districts", []),
+            key="district_picker",
+            on_change=update_pending,
+        )
+
+        # Show how many districts are pending vs confirmed
+        pending_count = len(st.session_state.get("pending_districts", []))
+        confirmed_count = len(st.session_state.get("confirmed_districts", []))
+
+        col_load, col_clear, col_status = st.columns([1, 1, 2])
+        with col_load:
+            if st.button("🗺️ Load Selected Districts", type="primary", use_container_width=True):
+                st.session_state["confirmed_districts"] = st.session_state.get("pending_districts", []).copy()
+                st.rerun()
+        with col_clear:
+            if st.button("🗑️ Clear All", use_container_width=True):
+                st.session_state["pending_districts"] = []
+                st.session_state["confirmed_districts"] = []
+                st.rerun()
+        with col_status:
+            if pending_count != confirmed_count:
+                st.warning(f"⏳ {pending_count} pending → click Load to apply")
+            elif confirmed_count > 0:
+                st.success(f"✅ {confirmed_count} districts loaded on map")
+            else:
+                st.info("No districts selected")
+
+        # The map uses confirmed_districts (only updates when button is clicked)
+        selected_districts = st.session_state.get("confirmed_districts", [])
 
         # If the user has selected the county-level population overlay, build a combined
         # map that overlays counties and district boundaries.  In addition to the
@@ -3165,6 +3216,9 @@ else:
                 )
 
             # Allow users to manually highlight districts
+            # NOTE: If this legacy code is re-enabled, consider updating to use the
+            # batch selection pattern from render_travel_canvas() to prevent map
+            # reloads on every multiselect change.
             all_districts = (
                 year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
             )
