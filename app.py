@@ -2041,6 +2041,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         # Location controls in a compact row
         st.markdown("### 📍 Starting Location")
         
+        # Row 1: Main action buttons
         col_btn1, col_btn2, col_search_box, col_go = st.columns([1.2, 1.2, 2, 0.8])
         
         with col_btn1:
@@ -2079,6 +2080,39 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                         st.rerun()
                     else:
                         st.warning("Location not found")
+        
+        # Row 2: County selector (alternative method that always works)
+        with st.expander("🏘️ Or select a county to center on", expanded=False):
+            try:
+                # Load county data for the selector
+                county_shapes_for_select, _ = load_us_county_shapes()
+                if not county_shapes_for_select.empty:
+                    # Build county options: "County, ST"
+                    county_shapes_for_select["county_label"] = county_shapes_for_select["county_name"] + ", " + county_shapes_for_select["state_po"]
+                    county_shapes_for_select = county_shapes_for_select.sort_values("county_label")
+                    county_options = [""] + county_shapes_for_select["county_label"].tolist()
+                    
+                    col_county, col_set_county = st.columns([3, 1])
+                    with col_county:
+                        selected_county = st.selectbox(
+                            "Select a county",
+                            options=county_options,
+                            index=0,
+                            key="county_selector",
+                            label_visibility="collapsed",
+                            placeholder="Type to search counties..."
+                        )
+                    with col_set_county:
+                        if st.button("📍 Go to County", use_container_width=True, disabled=not selected_county):
+                            if selected_county:
+                                county_row = county_shapes_for_select[county_shapes_for_select["county_label"] == selected_county].iloc[0]
+                                st.session_state["travel_lat"] = float(county_row["centroid_lat"])
+                                st.session_state["travel_lon"] = float(county_row["centroid_lon"])
+                                st.session_state["listening_for_click"] = False
+                                st.session_state["map_key_counter"] += 1
+                                st.rerun()
+            except Exception as e:
+                st.caption(f"County selector unavailable: {str(e)[:50]}")
         
         # Show current location and listening status
         current_lat = st.session_state.get("travel_lat", 39.5)
@@ -2420,13 +2454,21 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 if colormap:
                     colormap.add_to(m)
                 
+                # Add a LatLngPopup to capture clicks anywhere on the map
+                # This works even when clicking on GeoJSON layers
+                from folium.plugins import MousePosition
+                MousePosition().add_to(m)
+                
+                # Add click capture - this makes clicks register even on polygons
+                m.add_child(folium.LatLngPopup())
+                
                 # Add instruction overlay if listening
                 if is_listening:
                     folium.Marker(
                         [lat + 3, lon],
                         icon=folium.DivIcon(
-                            html='<div style="font-size: 16px; color: red; font-weight: bold; background: white; padding: 5px; border-radius: 5px;">👆 CLICK TO SET LOCATION</div>',
-                            icon_size=(250, 40)
+                            html='<div style="font-size: 16px; color: red; font-weight: bold; background: white; padding: 5px; border-radius: 5px; border: 2px solid red;">👆 CLICK ANYWHERE ON MAP - coordinates will appear in popup</div>',
+                            icon_size=(400, 40)
                         )
                     ).add_to(m)
                 
@@ -2437,18 +2479,45 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     width=None,  # Full width
                     height=550,
                     key=map_key,
-                    returned_objects=["last_clicked"]
+                    returned_objects=["last_clicked", "last_object_clicked"]
                 )
                 
-                # Handle click if listening
-                if is_listening and map_data and map_data.get("last_clicked"):
-                    clicked_lat = map_data["last_clicked"]["lat"]
-                    clicked_lon = map_data["last_clicked"]["lng"]
-                    st.session_state["travel_lat"] = clicked_lat
-                    st.session_state["travel_lon"] = clicked_lon
+                # Debug: show what we got from the map
+                if is_listening:
+                    st.caption(f"🔍 Debug - Map data: last_clicked={map_data.get('last_clicked') if map_data else None}")
+                
+                # Handle click if listening - try multiple sources
+                clicked_coords = None
+                if map_data:
+                    if map_data.get("last_clicked"):
+                        clicked_coords = (map_data["last_clicked"]["lat"], map_data["last_clicked"]["lng"])
+                    elif map_data.get("last_object_clicked"):
+                        clicked_coords = (map_data["last_object_clicked"]["lat"], map_data["last_object_clicked"]["lng"])
+                
+                if is_listening and clicked_coords:
+                    st.session_state["travel_lat"] = clicked_coords[0]
+                    st.session_state["travel_lon"] = clicked_coords[1]
                     st.session_state["listening_for_click"] = False
                     st.session_state["map_key_counter"] += 1
                     st.rerun()
+                
+                # Alternative: Manual coordinate entry when clicking doesn't work
+                if is_listening:
+                    st.markdown("---")
+                    st.markdown("**📍 Or enter coordinates manually from the popup:**")
+                    col_lat_manual, col_lon_manual, col_set = st.columns([1, 1, 1])
+                    with col_lat_manual:
+                        manual_lat = st.number_input("Latitude from popup", value=lat, format="%.6f", key="manual_lat_input")
+                    with col_lon_manual:
+                        manual_lon = st.number_input("Longitude from popup", value=lon, format="%.6f", key="manual_lon_input")
+                    with col_set:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("✅ Set This Location", type="primary", use_container_width=True):
+                            st.session_state["travel_lat"] = manual_lat
+                            st.session_state["travel_lon"] = manual_lon
+                            st.session_state["listening_for_click"] = False
+                            st.session_state["map_key_counter"] += 1
+                            st.rerun()
             
             else:
                 # Fallback to Plotly map (no click support)
