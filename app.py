@@ -2063,62 +2063,107 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             )
             st.session_state["travel_lon"] = float(lon)
 
-        # List of all districts for multiselect
+        # List of all districts for reference
         all_districts = (
             year_data[year]["dist_df"]["district_id"].dropna().astype(str).unique().tolist()
         )
         all_districts = sorted(all_districts)
 
         # ----------------------------------------------------------------
-        # BATCH DISTRICT SELECTION: Use session state to store pending and
-        # confirmed selections so the map only reloads when user clicks
-        # "Load Selected Districts" rather than on every multiselect change.
+        # BATCH DISTRICT SELECTION: Use a text area instead of multiselect
+        # to allow users to enter multiple districts without triggering
+        # a map reload on each keystroke/selection. The map only updates
+        # when the user clicks "Load Selected Districts".
         # ----------------------------------------------------------------
-        if "pending_districts" not in st.session_state:
-            st.session_state["pending_districts"] = []
         if "confirmed_districts" not in st.session_state:
             st.session_state["confirmed_districts"] = []
+        if "district_text_input" not in st.session_state:
+            st.session_state["district_text_input"] = ""
 
         st.markdown("**Select districts to highlight**")
+
+        # Show available districts in an expander for reference
+        with st.expander("📋 View available district IDs (click to expand)"):
+            # Group by state for easier browsing
+            districts_by_state = {}
+            for d in all_districts:
+                state = d.split("-")[0] if "-" in d else "OTHER"
+                if state not in districts_by_state:
+                    districts_by_state[state] = []
+                districts_by_state[state].append(d)
+            
+            # Display as columns of states
+            state_list = sorted(districts_by_state.keys())
+            cols = st.columns(6)
+            for i, state in enumerate(state_list):
+                with cols[i % 6]:
+                    st.markdown(f"**{state}**")
+                    st.caption(", ".join(districts_by_state[state]))
+
         st.caption(
-            "Add districts below, then click 'Load Selected Districts' to update the map. "
-            "This prevents the map from reloading after each selection."
+            "Enter district IDs below (e.g., TX-7, CA-45, NY-11), separated by commas, spaces, or new lines. "
+            "Then click 'Load Selected Districts' to update the map."
         )
 
-        # Use on_change callback to update pending_districts without triggering map reload
-        def update_pending():
-            st.session_state["pending_districts"] = st.session_state.get("district_picker", [])
-
-        # The multiselect updates pending_districts via callback but map uses confirmed_districts
-        st.multiselect(
-            "Districts to highlight (select multiple, then click Load)",
-            options=all_districts,
-            default=st.session_state.get("pending_districts", []),
-            key="district_picker",
-            on_change=update_pending,
+        # Text area for entering districts - does NOT trigger reload on typing
+        district_text = st.text_area(
+            "District IDs to highlight",
+            value=st.session_state.get("district_text_input", ""),
+            height=100,
+            placeholder="TX-7, CA-45, NY-11, PA-7, MI-8...",
+            key="district_text_area_input"
         )
 
-        # Show how many districts are pending vs confirmed
-        pending_count = len(st.session_state.get("pending_districts", []))
+        # Parse the text input into a list of valid district IDs
+        def parse_district_input(text):
+            if not text.strip():
+                return []
+            # Split by commas, spaces, newlines, semicolons
+            raw_items = re.split(r'[,\s;]+', text.strip())
+            # Normalize and validate each district ID
+            parsed = []
+            for item in raw_items:
+                item = item.strip().upper()
+                if not item:
+                    continue
+                # Check if it matches a valid district pattern and exists in our list
+                if item in [d.upper() for d in all_districts]:
+                    # Find the properly cased version
+                    for d in all_districts:
+                        if d.upper() == item:
+                            parsed.append(d)
+                            break
+            return list(dict.fromkeys(parsed))  # Remove duplicates while preserving order
+
+        pending_districts = parse_district_input(district_text)
         confirmed_count = len(st.session_state.get("confirmed_districts", []))
 
         col_load, col_clear, col_status = st.columns([1, 1, 2])
         with col_load:
             if st.button("🗺️ Load Selected Districts", type="primary", use_container_width=True):
-                st.session_state["confirmed_districts"] = st.session_state.get("pending_districts", []).copy()
+                st.session_state["confirmed_districts"] = pending_districts.copy()
+                st.session_state["district_text_input"] = district_text
                 st.rerun()
         with col_clear:
             if st.button("🗑️ Clear All", use_container_width=True):
-                st.session_state["pending_districts"] = []
                 st.session_state["confirmed_districts"] = []
+                st.session_state["district_text_input"] = ""
                 st.rerun()
         with col_status:
-            if pending_count != confirmed_count:
-                st.warning(f"⏳ {pending_count} pending → click Load to apply")
+            pending_count = len(pending_districts)
+            if pending_count != confirmed_count or district_text != st.session_state.get("district_text_input", ""):
+                if pending_count > 0:
+                    st.warning(f"⏳ {pending_count} district(s) ready → click Load to apply")
+                else:
+                    st.info("Enter district IDs above")
             elif confirmed_count > 0:
-                st.success(f"✅ {confirmed_count} districts loaded on map")
+                st.success(f"✅ {confirmed_count} district(s) loaded on map")
             else:
                 st.info("No districts selected")
+
+        # Show which districts were parsed (for user feedback)
+        if pending_districts and (pending_districts != st.session_state.get("confirmed_districts", [])):
+            st.caption(f"Parsed districts: {', '.join(pending_districts)}")
 
         # The map uses confirmed_districts (only updates when button is clicked)
         selected_districts = st.session_state.get("confirmed_districts", [])
