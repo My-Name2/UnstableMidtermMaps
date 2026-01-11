@@ -2037,149 +2037,62 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             st.session_state["map_key_counter"] = 0
 
         st.markdown("---")
-        st.markdown("### 📍 Set Starting Location")
-
-        # ----------------------------------------------------------------
-        # CLICKABLE MAP FOR LOCATION SELECTION (using folium if available)
-        # ----------------------------------------------------------------
-        if FOLIUM_AVAILABLE:
-            current_lat = st.session_state.get("travel_lat", 39.5)
-            current_lon = st.session_state.get("travel_lon", -98.35)
+        
+        # Location controls in a compact row
+        st.markdown("### 📍 Starting Location")
+        
+        col_btn1, col_btn2, col_search_box, col_go = st.columns([1.2, 1.2, 2, 0.8])
+        
+        with col_btn1:
             is_listening = st.session_state.get("listening_for_click", False)
-            
-            # Compute current radius for display
-            speeds_preview = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
-            speed_kmh_preview = speeds_preview.get(transport_mode, 96.56064)
-            radius_m_preview = float(speed_kmh_preview) * (time_minutes / 60.0) * 1000  # meters
-            
-            # Instructions and button
-            col_btn1, col_btn2, col_status = st.columns([1, 1, 2])
-            with col_btn1:
-                if st.button("🎯 Set New Location", type="primary" if not is_listening else "secondary", use_container_width=True):
-                    st.session_state["listening_for_click"] = True
-                    st.session_state["map_key_counter"] += 1  # Force map refresh
-                    st.rerun()
-            with col_btn2:
-                if st.button("🔄 Reset to Center US", use_container_width=True):
-                    st.session_state["travel_lat"] = 39.5
-                    st.session_state["travel_lon"] = -98.35
-                    st.session_state["listening_for_click"] = False
-                    st.session_state["map_key_counter"] += 1
-                    st.rerun()
-            with col_status:
-                if is_listening:
-                    st.warning("👆 **CLICK ON THE MAP** to set your new starting point!")
-                else:
-                    st.info(f"📍 Current: ({current_lat:.4f}, {current_lon:.4f})")
-            
-            # Create the folium map
-            m = folium.Map(
-                location=[current_lat, current_lon],
-                zoom_start=6,
-                tiles="CartoDB positron"
-            )
-            
-            # Add a marker for current location
-            folium.Marker(
-                [current_lat, current_lon],
-                popup=f"Current: ({current_lat:.4f}, {current_lon:.4f})",
-                icon=folium.Icon(color="green", icon="star")
-            ).add_to(m)
-            
-            # Add the travel radius circle
-            folium.Circle(
-                [current_lat, current_lon],
-                radius=radius_m_preview,
-                color="#009900",
-                weight=2,
-                fill=True,
-                fill_opacity=0.1,
-                popup=f"{time_minutes} min {transport_mode.lower()} radius"
-            ).add_to(m)
-            
-            # Add crosshairs at center if listening
-            if is_listening:
-                # Add a subtle instruction on the map
-                folium.Marker(
-                    [current_lat + 2, current_lon],
-                    icon=folium.DivIcon(
-                        html='<div style="font-size: 14px; color: red; font-weight: bold; white-space: nowrap;">⬇️ Click anywhere on map ⬇️</div>',
-                        icon_size=(200, 30)
-                    )
-                ).add_to(m)
-            
-            # Display the map with a dynamic key so it refreshes properly
-            map_key = f"location_picker_map_{st.session_state.get('map_key_counter', 0)}"
-            map_data = st_folium(
-                m,
-                width=700,
-                height=350,
-                key=map_key,
-                returned_objects=["last_clicked"]
-            )
-            
-            # If listening and user clicked, capture the location
-            if is_listening and map_data and map_data.get("last_clicked"):
-                clicked_lat = map_data["last_clicked"]["lat"]
-                clicked_lon = map_data["last_clicked"]["lng"]
-                st.session_state["travel_lat"] = clicked_lat
-                st.session_state["travel_lon"] = clicked_lon
+            if st.button("🎯 Click Map to Set" if not is_listening else "❌ Cancel", 
+                        type="primary" if not is_listening else "secondary", 
+                        use_container_width=True):
+                st.session_state["listening_for_click"] = not is_listening
+                st.session_state["map_key_counter"] += 1
+                st.rerun()
+        
+        with col_btn2:
+            if st.button("🔄 Reset Center", use_container_width=True):
+                st.session_state["travel_lat"] = 39.5
+                st.session_state["travel_lon"] = -98.35
                 st.session_state["listening_for_click"] = False
                 st.session_state["map_key_counter"] += 1
                 st.rerun()
-                
-        else:
-            st.info("💡 Install `folium` and `streamlit-folium` for click-to-set location: `pip install folium streamlit-folium`")
-
-        # Location search: allow users to enter a city/address/ZIP and geocode it
-        col_search, col_coords = st.columns([2, 1])
         
-        with col_search:
-            st.markdown("**🔍 Search location**")
+        with col_search_box:
             search_query = st.text_input(
-                "City, address, or ZIP code",
+                "Search location",
                 key="travel_location_search",
-                placeholder="e.g. Houston, TX or 10001",
+                placeholder="City, address, or ZIP...",
                 label_visibility="collapsed"
             )
-            if st.button("Search and set location", key="travel_search_button", use_container_width=True):
-                coords = geocode_location(search_query)
-                if coords:
-                    st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
-                    st.session_state["listening_for_click"] = False
-                    st.session_state["map_key_counter"] += 1
-                    st.rerun()
-                else:
-                    st.warning("Could not find that location. Please try a different search term.")
-
-        with col_coords:
-            st.markdown("**📐 Manual coordinates**")
-            lat = st.number_input(
-                "Latitude",
-                min_value=-90.0,
-                max_value=90.0,
-                value=float(st.session_state.get("travel_lat", 39.5)),
-                step=0.1,
-                key="travel_lat_input",
-                format="%.4f"
-            )
-            lon = st.number_input(
-                "Longitude",
-                min_value=-180.0,
-                max_value=180.0,
-                value=float(st.session_state.get("travel_lon", -98.35)),
-                step=0.1,
-                key="travel_lon_input",
-                format="%.4f"
-            )
-            if st.button("Update Location", key="update_coords_btn", use_container_width=True):
-                st.session_state["travel_lat"] = float(lat)
-                st.session_state["travel_lon"] = float(lon)
-                st.rerun()
+        
+        with col_go:
+            if st.button("🔍", key="travel_search_button", use_container_width=True):
+                if search_query:
+                    coords = geocode_location(search_query)
+                    if coords:
+                        st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
+                        st.session_state["listening_for_click"] = False
+                        st.session_state["map_key_counter"] += 1
+                        st.rerun()
+                    else:
+                        st.warning("Location not found")
+        
+        # Show current location and listening status
+        current_lat = st.session_state.get("travel_lat", 39.5)
+        current_lon = st.session_state.get("travel_lon", -98.35)
+        is_listening = st.session_state.get("listening_for_click", False)
+        
+        if is_listening:
+            st.warning("👆 **Click anywhere on the map below to set your starting location!**")
+        else:
+            st.caption(f"📍 Current location: ({current_lat:.4f}, {current_lon:.4f})")
         
         # Use current session state values
-        lat = st.session_state.get("travel_lat", 39.5)
-        lon = st.session_state.get("travel_lon", -98.35)
+        lat = current_lat
+        lon = current_lon
         
         st.markdown("---")
 
@@ -2410,25 +2323,12 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
 
         # Build and display the travel map figure
         if not us_gdf.empty:
-            fig_travel = make_travel_map_figure(
-                year,
-                overlay_type,
-                transport_mode,
-                time_minutes,
-                lat,
-                lon,
-                selected_districts,
-                year_data[year]["dist_df"],
-                us_gdf,
-                us_geojson,
-                enable_acs,
-            )
-            st.plotly_chart(fig_travel, use_container_width=True)
-
-            # Compute distances and travel times for each district to display in summary table
+            # Compute distances and travel times for each district
             speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
             speed_kmh = speed_map.get(transport_mode, 96.56064)
             radius_km = float(speed_kmh) * (time_minutes / 60.0)
+            radius_m = radius_km * 1000
+            
             # Include district FIPS for display in summary tables
             temp = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
             temp["distance_km"] = temp.apply(
@@ -2436,6 +2336,137 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 axis=1,
             )
             temp["travel_minutes"] = (temp["distance_km"] / speed_kmh) * 60.0
+            
+            # ----------------------------------------------------------------
+            # UNIFIED MAP: Use Folium if available (clickable), else Plotly
+            # ----------------------------------------------------------------
+            is_listening = st.session_state.get("listening_for_click", False)
+            
+            if FOLIUM_AVAILABLE:
+                # Create unified Folium map with district choropleth + click support
+                import branca.colormap as cm
+                
+                # Prepare overlay data
+                if overlay_type == "Population heatmap" and enable_acs and "acs_total_pop" in year_data[year]["dist_df"].columns:
+                    overlay_col = "acs_total_pop"
+                    overlay_data = year_data[year]["dist_df"].set_index("district_id")[overlay_col].to_dict()
+                    colormap = cm.LinearColormap(['#ffffcc', '#fd8d3c', '#bd0026'], vmin=0, vmax=800000, caption='Population')
+                elif "house_margin" in year_data[year]["dist_df"].columns:
+                    overlay_col = "house_margin"
+                    overlay_data = year_data[year]["dist_df"].set_index("district_id")[overlay_col].to_dict()
+                    colormap = cm.LinearColormap(['#2166ac', '#f7f7f7', '#b2182b'], vmin=-0.5, vmax=0.5, caption='House Margin (R-D)')
+                else:
+                    overlay_data = {}
+                    colormap = None
+                
+                # Create the map centered on current location
+                m = folium.Map(
+                    location=[lat, lon],
+                    zoom_start=6,
+                    tiles="CartoDB positron"
+                )
+                
+                # Style function for districts
+                def style_function(feature):
+                    did = feature['properties'].get('district_id', '')
+                    val = overlay_data.get(did, None)
+                    within = temp[temp["district_id"] == did]["distance_km"].values
+                    is_within = len(within) > 0 and within[0] <= radius_km
+                    is_selected = did in selected_districts
+                    
+                    if val is not None and colormap:
+                        fill_color = colormap(val)
+                    else:
+                        fill_color = '#cccccc'
+                    
+                    if is_selected:
+                        return {'fillColor': fill_color, 'color': '#0000FF', 'weight': 3, 'fillOpacity': 0.7}
+                    elif is_within:
+                        return {'fillColor': fill_color, 'color': '#009900', 'weight': 2, 'fillOpacity': 0.6}
+                    else:
+                        return {'fillColor': fill_color, 'color': '#999999', 'weight': 0.5, 'fillOpacity': 0.4}
+                
+                # Add district choropleth layer
+                folium.GeoJson(
+                    us_geojson,
+                    style_function=style_function,
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=['district_id'],
+                        aliases=['District:'],
+                        localize=True
+                    )
+                ).add_to(m)
+                
+                # Add the travel radius circle
+                folium.Circle(
+                    [lat, lon],
+                    radius=radius_m,
+                    color="#009900",
+                    weight=3,
+                    fill=True,
+                    fill_color="#00ff00",
+                    fill_opacity=0.1,
+                    popup=f"{time_minutes} min {transport_mode.lower()} radius"
+                ).add_to(m)
+                
+                # Add starting point marker
+                folium.Marker(
+                    [lat, lon],
+                    popup=f"Start: ({lat:.4f}, {lon:.4f})",
+                    icon=folium.Icon(color="green", icon="star")
+                ).add_to(m)
+                
+                # Add colormap legend
+                if colormap:
+                    colormap.add_to(m)
+                
+                # Add instruction overlay if listening
+                if is_listening:
+                    folium.Marker(
+                        [lat + 3, lon],
+                        icon=folium.DivIcon(
+                            html='<div style="font-size: 16px; color: red; font-weight: bold; background: white; padding: 5px; border-radius: 5px;">👆 CLICK TO SET LOCATION</div>',
+                            icon_size=(250, 40)
+                        )
+                    ).add_to(m)
+                
+                # Display the unified map
+                map_key = f"unified_travel_map_{st.session_state.get('map_key_counter', 0)}"
+                map_data = st_folium(
+                    m,
+                    width=None,  # Full width
+                    height=550,
+                    key=map_key,
+                    returned_objects=["last_clicked"]
+                )
+                
+                # Handle click if listening
+                if is_listening and map_data and map_data.get("last_clicked"):
+                    clicked_lat = map_data["last_clicked"]["lat"]
+                    clicked_lon = map_data["last_clicked"]["lng"]
+                    st.session_state["travel_lat"] = clicked_lat
+                    st.session_state["travel_lon"] = clicked_lon
+                    st.session_state["listening_for_click"] = False
+                    st.session_state["map_key_counter"] += 1
+                    st.rerun()
+            
+            else:
+                # Fallback to Plotly map (no click support)
+                fig_travel = make_travel_map_figure(
+                    year,
+                    overlay_type,
+                    transport_mode,
+                    time_minutes,
+                    lat,
+                    lon,
+                    selected_districts,
+                    year_data[year]["dist_df"],
+                    us_gdf,
+                    us_geojson,
+                    enable_acs,
+                )
+                st.plotly_chart(fig_travel, use_container_width=True)
+
             merge_val = None
             # Prepare overlay value for map and table based on selected overlay type
             if overlay_type == "Population heatmap" and enable_acs and "acs_total_pop" in year_data[year]["dist_df"].columns:
