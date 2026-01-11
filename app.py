@@ -33,6 +33,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+# Optional: folium for clickable location picker map
+try:
+    import folium
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    FOLIUM_AVAILABLE = False
+
 # ----------------------------
 # CONFIG
 # ----------------------------
@@ -2010,7 +2018,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
 
         # Transportation mode selection
         transport_mode = st.radio(
-            "Transportation mode", ["Driving", "Walking", "Cycling"], index=0
+            "Transportation mode", ["Driving", "Walking", "Cycling"], index=0, horizontal=True
         )
         time_minutes = st.slider(
             "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
@@ -2024,44 +2032,117 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         if "travel_lon" not in st.session_state:
             st.session_state["travel_lon"] = -98.35
 
-        # Location search: allow users to enter a city/address/ZIP and geocode it
-        st.markdown("**Find a location**")
-        search_query = st.text_input(
-            "Search by city, address, or ZIP code",
-            key="travel_location_search",
-            placeholder="e.g. Houston, TX or 10001"
-        )
-        if st.button("Search and set location", key="travel_search_button"):
-            coords = geocode_location(search_query)
-            if coords:
-                st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
-            else:
-                st.warning("Could not find that location. Please try a different search term.")
+        st.markdown("---")
+        st.markdown("### 📍 Set Starting Location")
+        st.caption("Click on the map below to set your starting point, or use the search/coordinates.")
 
-        # Starting location numeric inputs.  These are pre‑filled from session state
-        # and update the session state whenever edited.
-        st.markdown("**Starting location (latitude & longitude)**")
-        col_lat, col_lon = st.columns(2)
-        with col_lat:
+        # ----------------------------------------------------------------
+        # CLICKABLE MAP FOR LOCATION SELECTION (using folium if available)
+        # ----------------------------------------------------------------
+        if FOLIUM_AVAILABLE:
+            # Create a small folium map for clicking
+            current_lat = st.session_state.get("travel_lat", 39.5)
+            current_lon = st.session_state.get("travel_lon", -98.35)
+            
+            # Compute current radius for display
+            speeds_preview = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
+            speed_kmh_preview = speeds_preview.get(transport_mode, 96.56064)
+            radius_m_preview = float(speed_kmh_preview) * (time_minutes / 60.0) * 1000  # meters
+            
+            m = folium.Map(
+                location=[current_lat, current_lon],
+                zoom_start=6,
+                tiles="CartoDB positron"
+            )
+            
+            # Add a marker for current location
+            folium.Marker(
+                [current_lat, current_lon],
+                popup=f"Current: ({current_lat:.4f}, {current_lon:.4f})",
+                icon=folium.Icon(color="green", icon="play")
+            ).add_to(m)
+            
+            # Add the travel radius circle
+            folium.Circle(
+                [current_lat, current_lon],
+                radius=radius_m_preview,
+                color="#009900",
+                weight=2,
+                fill=True,
+                fill_opacity=0.1,
+                popup=f"{time_minutes} min {transport_mode.lower()} radius"
+            ).add_to(m)
+            
+            # Display the map and capture clicks
+            with st.container():
+                map_data = st_folium(
+                    m,
+                    width=700,
+                    height=350,
+                    key="location_picker_map",
+                    returned_objects=["last_clicked"]
+                )
+            
+            # If user clicked on the map, update the location
+            if map_data and map_data.get("last_clicked"):
+                clicked_lat = map_data["last_clicked"]["lat"]
+                clicked_lon = map_data["last_clicked"]["lng"]
+                if clicked_lat != st.session_state.get("travel_lat") or clicked_lon != st.session_state.get("travel_lon"):
+                    st.session_state["travel_lat"] = clicked_lat
+                    st.session_state["travel_lon"] = clicked_lon
+                    st.rerun()
+        else:
+            st.info("💡 Install `folium` and `streamlit-folium` for click-to-set location: `pip install folium streamlit-folium`")
+
+        # Location search: allow users to enter a city/address/ZIP and geocode it
+        col_search, col_coords = st.columns([2, 1])
+        
+        with col_search:
+            st.markdown("**🔍 Search location**")
+            search_query = st.text_input(
+                "City, address, or ZIP code",
+                key="travel_location_search",
+                placeholder="e.g. Houston, TX or 10001",
+                label_visibility="collapsed"
+            )
+            if st.button("Search and set location", key="travel_search_button", use_container_width=True):
+                coords = geocode_location(search_query)
+                if coords:
+                    st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
+                    st.rerun()
+                else:
+                    st.warning("Could not find that location. Please try a different search term.")
+
+        with col_coords:
+            st.markdown("**📐 Manual coordinates**")
             lat = st.number_input(
                 "Latitude",
                 min_value=-90.0,
                 max_value=90.0,
                 value=float(st.session_state.get("travel_lat", 39.5)),
                 step=0.1,
-                key="travel_lat_input"
+                key="travel_lat_input",
+                format="%.4f"
             )
-            st.session_state["travel_lat"] = float(lat)
-        with col_lon:
             lon = st.number_input(
                 "Longitude",
                 min_value=-180.0,
                 max_value=180.0,
                 value=float(st.session_state.get("travel_lon", -98.35)),
                 step=0.1,
-                key="travel_lon_input"
+                key="travel_lon_input",
+                format="%.4f"
             )
-            st.session_state["travel_lon"] = float(lon)
+            if st.button("Update Location", key="update_coords_btn", use_container_width=True):
+                st.session_state["travel_lat"] = float(lat)
+                st.session_state["travel_lon"] = float(lon)
+                st.rerun()
+        
+        # Use current session state values
+        lat = st.session_state.get("travel_lat", 39.5)
+        lon = st.session_state.get("travel_lon", -98.35)
+        
+        st.markdown("---")
 
         # List of all districts for reference
         all_districts = (
@@ -2380,13 +2461,129 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     if label not in cols_to_show:
                         cols_to_show.append(label)
 
-            if not disp_view.empty:
-                st.markdown("**Reachable / Selected districts**")
-                st.dataframe(
-                    disp_view[cols_to_show].rename(columns={"district_id": "District", "district_fips": "District FIPS"}).reset_index(drop=True),
-                    use_container_width=True,
-                    height=320,
-                )
+            # ----------------------------------------------------------------
+            # COMPACT SUMMARY PANELS: Districts and Counties within radius
+            # ----------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("### 📊 What's Within Your Travel Radius")
+            
+            # Filter to only districts within the radius (not selected ones outside)
+            districts_in_radius = disp[disp["within_radius"] == True].copy()
+            districts_in_radius = districts_in_radius.sort_values("travel_minutes", ascending=True)
+            
+            # Create two columns for side-by-side display
+            col_districts, col_counties = st.columns(2)
+            
+            with col_districts:
+                st.markdown("#### 🗳️ Congressional Districts in Radius")
+                if not districts_in_radius.empty:
+                    num_districts = len(districts_in_radius)
+                    st.metric("Districts Reachable", num_districts)
+                    
+                    # Show compact list of districts
+                    district_list = districts_in_radius["district_id"].tolist()
+                    st.caption(f"Districts: {', '.join(district_list[:20])}" + ("..." if len(district_list) > 20 else ""))
+                    
+                    # Show detailed table in expander
+                    with st.expander(f"📋 View all {num_districts} districts", expanded=False):
+                        display_cols = ["district_id", "Distance (km)", "Travel time (min)"]
+                        if "Population" in districts_in_radius.columns:
+                            display_cols.append("Population")
+                        if "House margin (R-D)" in districts_in_radius.columns:
+                            display_cols.append("House margin (R-D)")
+                        st.dataframe(
+                            districts_in_radius[display_cols].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                            use_container_width=True,
+                            height=min(400, 35 + 35 * num_districts)
+                        )
+                else:
+                    st.info("No districts within radius")
+            
+            with col_counties:
+                st.markdown("#### 🏘️ Largest Counties by Population")
+                # Try to load county data for the counties-in-radius view
+                try:
+                    county_shapes, county_geojson = load_us_county_shapes()
+                    # Try to get population data
+                    try:
+                        county_pop = load_county_population(2023, None)
+                    except Exception:
+                        try:
+                            county_pop = load_county_population(2022, None)
+                        except Exception:
+                            county_pop = pd.DataFrame()
+                    
+                    if not county_pop.empty:
+                        county_df = county_shapes.merge(
+                            county_pop[["county_id", "total_pop"]], on="county_id", how="left"
+                        )
+                        
+                        # Compute distances for counties
+                        county_df["distance_km"] = county_df.apply(
+                            lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                            axis=1
+                        )
+                        county_df["within_radius"] = county_df["distance_km"] <= radius_km
+                        
+                        counties_in_radius = county_df[county_df["within_radius"] == True].copy()
+                        
+                        if not counties_in_radius.empty:
+                            num_counties = len(counties_in_radius)
+                            total_pop = counties_in_radius["total_pop"].sum()
+                            
+                            col_metric1, col_metric2 = st.columns(2)
+                            with col_metric1:
+                                st.metric("Counties", num_counties)
+                            with col_metric2:
+                                st.metric("Total Pop.", fmt_int(total_pop))
+                            
+                            # Show top 10 counties by population
+                            top_counties = counties_in_radius.nlargest(10, "total_pop")[["county_name", "state_po", "total_pop", "distance_km"]].copy()
+                            top_counties["County"] = top_counties["county_name"] + ", " + top_counties["state_po"]
+                            top_counties["Population"] = top_counties["total_pop"].apply(fmt_int)
+                            top_counties["Distance (km)"] = top_counties["distance_km"].apply(lambda v: f"{v:.1f}")
+                            
+                            st.caption("**Top 10 by population:**")
+                            st.dataframe(
+                                top_counties[["County", "Population", "Distance (km)"]].reset_index(drop=True),
+                                use_container_width=True,
+                                height=min(390, 35 + 35 * len(top_counties))
+                            )
+                            
+                            # Full list in expander
+                            with st.expander(f"📋 View all {num_counties} counties", expanded=False):
+                                all_counties = counties_in_radius.sort_values("total_pop", ascending=False).copy()
+                                all_counties["County"] = all_counties["county_name"] + ", " + all_counties["state_po"]
+                                all_counties["Population"] = all_counties["total_pop"].apply(fmt_int)
+                                all_counties["Distance (km)"] = all_counties["distance_km"].apply(lambda v: f"{v:.1f}")
+                                st.dataframe(
+                                    all_counties[["County", "Population", "Distance (km)"]].reset_index(drop=True),
+                                    use_container_width=True,
+                                    height=400
+                                )
+                        else:
+                            st.info("No counties within radius")
+                    else:
+                        st.caption("County population data not available")
+                except Exception as e:
+                    st.caption(f"County data unavailable: {str(e)[:50]}")
+
+            # Show selected districts (if any) separately
+            if selected_districts:
+                st.markdown("---")
+                st.markdown("### ⭐ Your Highlighted Districts")
+                selected_in_disp = disp[disp["district_id"].isin(selected_districts)].copy()
+                if not selected_in_disp.empty:
+                    display_cols_sel = ["district_id", "Distance (km)", "Travel time (min)"]
+                    if "Population" in selected_in_disp.columns:
+                        display_cols_sel.append("Population")
+                    if "House margin (R-D)" in selected_in_disp.columns:
+                        display_cols_sel.append("House margin (R-D)")
+                    st.dataframe(
+                        selected_in_disp[display_cols_sel].rename(columns={"district_id": "District"}).reset_index(drop=True),
+                        use_container_width=True,
+                        height=min(300, 35 + 35 * len(selected_in_disp))
+                    )
 
             # Show aggregated ACS statistics for reachable districts
             if enable_acs:
@@ -2397,6 +2594,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     # Compute total reachable population; if zero or NaN skip aggregation
                     total_pop_reach = reach_df.get("acs_total_pop", pd.Series(dtype=float)).sum(skipna=True)
                     if pd.notna(total_pop_reach) and total_pop_reach > 0:
+                        st.markdown("---")
+                        st.markdown("### 📈 Aggregated Demographics (Reachable Districts)")
                         agg_metrics = {}
                         for c in acs_cols_present:
                             label = ACS_LABELS.get(c, c)
@@ -2417,7 +2616,6 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                                 num = (reach_df[c] * reach_df["acs_total_pop"]).sum(skipna=True)
                                 val = num / total_pop_reach if pd.notna(num) else np.nan
                                 agg_metrics[f"Avg {label}"] = fmt_pct(val) if pd.notna(val) else ""
-                        st.markdown("**Aggregated ACS demographics of reachable districts**")
                         # Convert metrics dict to a single‑row DataFrame for display
                         agg_df = pd.DataFrame([agg_metrics])
                         st.dataframe(agg_df, use_container_width=True, height=min(200, 100 + 20 * len(agg_df.columns)))
