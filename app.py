@@ -2031,24 +2031,48 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             st.session_state["travel_lat"] = 39.5
         if "travel_lon" not in st.session_state:
             st.session_state["travel_lon"] = -98.35
+        if "listening_for_click" not in st.session_state:
+            st.session_state["listening_for_click"] = False
+        if "map_key_counter" not in st.session_state:
+            st.session_state["map_key_counter"] = 0
 
         st.markdown("---")
         st.markdown("### 📍 Set Starting Location")
-        st.caption("Click on the map below to set your starting point, or use the search/coordinates.")
 
         # ----------------------------------------------------------------
         # CLICKABLE MAP FOR LOCATION SELECTION (using folium if available)
         # ----------------------------------------------------------------
         if FOLIUM_AVAILABLE:
-            # Create a small folium map for clicking
             current_lat = st.session_state.get("travel_lat", 39.5)
             current_lon = st.session_state.get("travel_lon", -98.35)
+            is_listening = st.session_state.get("listening_for_click", False)
             
             # Compute current radius for display
             speeds_preview = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
             speed_kmh_preview = speeds_preview.get(transport_mode, 96.56064)
             radius_m_preview = float(speed_kmh_preview) * (time_minutes / 60.0) * 1000  # meters
             
+            # Instructions and button
+            col_btn1, col_btn2, col_status = st.columns([1, 1, 2])
+            with col_btn1:
+                if st.button("🎯 Set New Location", type="primary" if not is_listening else "secondary", use_container_width=True):
+                    st.session_state["listening_for_click"] = True
+                    st.session_state["map_key_counter"] += 1  # Force map refresh
+                    st.rerun()
+            with col_btn2:
+                if st.button("🔄 Reset to Center US", use_container_width=True):
+                    st.session_state["travel_lat"] = 39.5
+                    st.session_state["travel_lon"] = -98.35
+                    st.session_state["listening_for_click"] = False
+                    st.session_state["map_key_counter"] += 1
+                    st.rerun()
+            with col_status:
+                if is_listening:
+                    st.warning("👆 **CLICK ON THE MAP** to set your new starting point!")
+                else:
+                    st.info(f"📍 Current: ({current_lat:.4f}, {current_lon:.4f})")
+            
+            # Create the folium map
             m = folium.Map(
                 location=[current_lat, current_lon],
                 zoom_start=6,
@@ -2059,7 +2083,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             folium.Marker(
                 [current_lat, current_lon],
                 popup=f"Current: ({current_lat:.4f}, {current_lon:.4f})",
-                icon=folium.Icon(color="green", icon="play")
+                icon=folium.Icon(color="green", icon="star")
             ).add_to(m)
             
             # Add the travel radius circle
@@ -2073,24 +2097,37 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 popup=f"{time_minutes} min {transport_mode.lower()} radius"
             ).add_to(m)
             
-            # Display the map and capture clicks
-            with st.container():
-                map_data = st_folium(
-                    m,
-                    width=700,
-                    height=350,
-                    key="location_picker_map",
-                    returned_objects=["last_clicked"]
-                )
+            # Add crosshairs at center if listening
+            if is_listening:
+                # Add a subtle instruction on the map
+                folium.Marker(
+                    [current_lat + 2, current_lon],
+                    icon=folium.DivIcon(
+                        html='<div style="font-size: 14px; color: red; font-weight: bold; white-space: nowrap;">⬇️ Click anywhere on map ⬇️</div>',
+                        icon_size=(200, 30)
+                    )
+                ).add_to(m)
             
-            # If user clicked on the map, update the location
-            if map_data and map_data.get("last_clicked"):
+            # Display the map with a dynamic key so it refreshes properly
+            map_key = f"location_picker_map_{st.session_state.get('map_key_counter', 0)}"
+            map_data = st_folium(
+                m,
+                width=700,
+                height=350,
+                key=map_key,
+                returned_objects=["last_clicked"]
+            )
+            
+            # If listening and user clicked, capture the location
+            if is_listening and map_data and map_data.get("last_clicked"):
                 clicked_lat = map_data["last_clicked"]["lat"]
                 clicked_lon = map_data["last_clicked"]["lng"]
-                if clicked_lat != st.session_state.get("travel_lat") or clicked_lon != st.session_state.get("travel_lon"):
-                    st.session_state["travel_lat"] = clicked_lat
-                    st.session_state["travel_lon"] = clicked_lon
-                    st.rerun()
+                st.session_state["travel_lat"] = clicked_lat
+                st.session_state["travel_lon"] = clicked_lon
+                st.session_state["listening_for_click"] = False
+                st.session_state["map_key_counter"] += 1
+                st.rerun()
+                
         else:
             st.info("💡 Install `folium` and `streamlit-folium` for click-to-set location: `pip install folium streamlit-folium`")
 
@@ -2109,6 +2146,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 coords = geocode_location(search_query)
                 if coords:
                     st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
+                    st.session_state["listening_for_click"] = False
+                    st.session_state["map_key_counter"] += 1
                     st.rerun()
                 else:
                     st.warning("Could not find that location. Please try a different search term.")
