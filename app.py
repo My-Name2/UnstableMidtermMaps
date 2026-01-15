@@ -626,6 +626,9 @@ ACS_OUTPUT_COLS = [
     "acs_median_hh_income",
     "acs_pct_bachelors_or_higher",
     "acs_pct_veteran",
+    "acs_median_rent",
+    "acs_median_home_value",
+    "acs_pct_owner_occupied",
 ]
 
 # Mapping of ACS variables to user-friendly labels for the travel table.
@@ -644,6 +647,9 @@ ACS_LABELS = {
     "acs_median_hh_income": "Median HH income",
     "acs_pct_bachelors_or_higher": "% Bachelor+ (25+)",
     "acs_pct_veteran": "% veteran (18+)",
+    "acs_median_rent": "Median rent",
+    "acs_median_home_value": "Median home value",
+    "acs_pct_owner_occupied": "% owner occupied",
 }
 
 # ----------------------------
@@ -818,6 +824,23 @@ def resolve_acs_profile_varmap(acs_year: int):
     varmap["acs_pct_veteran"] = (
         _pick_var_code(vars_meta, True, ["percent", "veteran"], [])
         or _pick_var_code(vars_meta, True, ["percent", "civilian population 18 years and over", "veteran"], [])
+    )
+
+    # Housing cost variables
+    varmap["acs_median_rent"] = (
+        _pick_var_code(vars_meta, False, ["median", "gross rent"], ["margin of error"])
+        or _pick_var_code(vars_meta, False, ["median gross rent"], [])
+        or _pick_var_code(vars_meta, False, ["median", "contract rent"], [])
+    )
+    
+    varmap["acs_median_home_value"] = (
+        _pick_var_code(vars_meta, False, ["median", "value"], ["margin of error", "rent"])
+        or _pick_var_code(vars_meta, False, ["median value"], ["rent"])
+    )
+    
+    varmap["acs_pct_owner_occupied"] = (
+        _pick_var_code(vars_meta, True, ["percent", "owner-occupied"], [])
+        or _pick_var_code(vars_meta, True, ["percent", "owner occupied"], [])
     )
 
     for k in ACS_OUTPUT_COLS:
@@ -1257,6 +1280,34 @@ def load_us_county_shapes(cache_dir: str = "county_shapes_cache"):
     # Prepare GeoJSON representation
     geojson = json.loads(gdf.to_json())
     return gdf, geojson
+
+
+def find_county_at_point(lat: float, lon: float) -> str:
+    """
+    Fast lookup of county name at a given lat/lon point.
+    Uses cached county shapes and returns "County, ST" or empty string.
+    """
+    try:
+        county_gdf, _ = load_us_county_shapes()
+        if county_gdf.empty or "geometry" not in county_gdf.columns:
+            return ""
+        from shapely.geometry import Point
+        pt = Point(lon, lat)
+        # Use spatial index if available for faster lookup
+        if hasattr(county_gdf, 'sindex'):
+            possible_matches_idx = list(county_gdf.sindex.intersection(pt.bounds))
+            if possible_matches_idx:
+                for idx in possible_matches_idx:
+                    row = county_gdf.iloc[idx]
+                    if row["geometry"] is not None and row["geometry"].contains(pt):
+                        return f"{row['county_name']}, {row['state_po']}"
+        # Fallback to simple iteration (slower)
+        for idx, row in county_gdf.iterrows():
+            if row["geometry"] is not None and row["geometry"].contains(pt):
+                return f"{row['county_name']}, {row['state_po']}"
+    except Exception:
+        pass
+    return ""
 
 
 @st.cache_data(show_spinner=True)
@@ -2011,18 +2062,26 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             # County-level population provides a more granular view of the ACS 5‑year
             # total population estimates for all counties
             overlay_options.insert(0, "County population heatmap")
-        # Use a neutral label since not all overlays apply strictly to districts
-        overlay_type = st.radio(
-            "Colour by", overlay_options, index=0
-        )
-
-        # Transportation mode selection
-        transport_mode = st.radio(
-            "Transportation mode", ["Driving", "Walking", "Cycling"], index=0, horizontal=True
-        )
-        time_minutes = st.slider(
-            "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
-        )
+        
+        # Controls row 1: Overlay and transport
+        col_overlay, col_transport = st.columns([1, 1])
+        with col_overlay:
+            overlay_type = st.radio(
+                "Colour by", overlay_options, index=0, horizontal=True
+            )
+        with col_transport:
+            transport_mode = st.radio(
+                "Transportation mode", ["Driving", "Walking", "Cycling"], index=0, horizontal=True
+            )
+        
+        # Controls row 2: Time slider and toggles
+        col_time, col_toggles = st.columns([2, 1])
+        with col_time:
+            time_minutes = st.slider(
+                "Travel time (minutes)", min_value=5, max_value=120, value=60, step=5
+            )
+        with col_toggles:
+            show_district_labels = st.checkbox("Show district labels on map", value=False, key="show_district_labels")
 
         # Starting location selection
         # Use Streamlit session state to persist the chosen starting location across
@@ -2119,19 +2178,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         current_lon = st.session_state.get("travel_lon", -98.35)
         is_listening = st.session_state.get("listening_for_click", False)
         
-        # Look up the county name for the current location
-        current_county_display = ""
-        try:
-            county_shapes_for_lookup, _ = load_us_county_shapes()
-            if not county_shapes_for_lookup.empty and "geometry" in county_shapes_for_lookup.columns:
-                from shapely.geometry import Point
-                current_point = Point(current_lon, current_lat)
-                for idx, row in county_shapes_for_lookup.iterrows():
-                    if row["geometry"] is not None and row["geometry"].contains(current_point):
-                        current_county_display = f" — **{row['county_name']}, {row['state_po']}**"
-                        break
-        except Exception:
-            pass
+        # Look up the county name for the current location (using fast helper)
+        current_county_name = find_county_at_point(current_lat, current_lon)
+        current_county_display = f" — **{current_county_name}**" if current_county_name else ""
         
         if is_listening:
             st.warning("👆 **Click anywhere on the map below to set your starting location!**")
@@ -2445,6 +2494,22 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     )
                 ).add_to(m)
                 
+                # Add district name labels if toggle is enabled
+                if show_district_labels:
+                    for idx, row in us_gdf.iterrows():
+                        did = row.get("district_id", "")
+                        clat = row.get("centroid_lat", np.nan)
+                        clon = row.get("centroid_lon", np.nan)
+                        if did and pd.notna(clat) and pd.notna(clon):
+                            folium.Marker(
+                                [clat, clon],
+                                icon=folium.DivIcon(
+                                    html=f'<div style="font-size: 9px; font-weight: bold; color: #333; text-shadow: 1px 1px 1px white, -1px -1px 1px white, 1px -1px 1px white, -1px 1px 1px white; white-space: nowrap;">{did}</div>',
+                                    icon_size=(50, 15),
+                                    icon_anchor=(25, 7)
+                                )
+                            ).add_to(m)
+                
                 # Add the travel radius circle
                 folium.Circle(
                     [lat, lon],
@@ -2457,20 +2522,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     popup=f"{time_minutes} min {transport_mode.lower()} radius"
                 ).add_to(m)
                 
-                # Find which county the starting point is in
-                starting_county_name = ""
-                try:
-                    county_shapes_lookup, _ = load_us_county_shapes()
-                    if not county_shapes_lookup.empty and "geometry" in county_shapes_lookup.columns:
-                        from shapely.geometry import Point
-                        start_point = Point(lon, lat)
-                        # Find the county containing this point
-                        for idx, row in county_shapes_lookup.iterrows():
-                            if row["geometry"] is not None and row["geometry"].contains(start_point):
-                                starting_county_name = f"{row['county_name']}, {row['state_po']}"
-                                break
-                except Exception:
-                    pass
+                # Find which county the starting point is in (using fast helper)
+                starting_county_name = find_county_at_point(lat, lon)
                 
                 # Add starting point marker
                 folium.Marker(
@@ -2613,7 +2666,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     label = ACS_LABELS.get(c, c)
                     if c == "acs_total_pop":
                         disp[label] = disp[c].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
-                    elif c == "acs_median_hh_income":
+                    elif c in ("acs_median_hh_income", "acs_median_rent", "acs_median_home_value"):
                         disp[label] = disp[c].apply(lambda v: fmt_money(v) if pd.notna(v) else "")
                     elif c == "acs_median_age":
                         disp[label] = disp[c].apply(lambda v: f"{float(v):.1f}" if pd.notna(v) else "")
@@ -2650,6 +2703,87 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             districts_in_radius = disp[disp["within_radius"] == True].copy()
             districts_in_radius = districts_in_radius.sort_values("travel_minutes", ascending=True)
             
+            # Calculate total reachable population and cost of living metrics from districts
+            total_reachable_pop = 0
+            avg_median_income = None
+            avg_median_rent = None
+            avg_home_value = None
+            if enable_acs and "acs_total_pop" in temp.columns:
+                reachable_temp = temp[temp["within_radius"] == True]
+                total_reachable_pop = reachable_temp["acs_total_pop"].sum(skipna=True)
+                if total_reachable_pop > 0:
+                    # Weighted average of median income
+                    if "acs_median_hh_income" in reachable_temp.columns:
+                        weighted_income = (reachable_temp["acs_median_hh_income"] * reachable_temp["acs_total_pop"]).sum(skipna=True)
+                        avg_median_income = weighted_income / total_reachable_pop if pd.notna(weighted_income) else None
+                    # Weighted average of median rent (actual ACS data)
+                    if "acs_median_rent" in reachable_temp.columns:
+                        weighted_rent = (reachable_temp["acs_median_rent"] * reachable_temp["acs_total_pop"]).sum(skipna=True)
+                        avg_median_rent = weighted_rent / total_reachable_pop if pd.notna(weighted_rent) else None
+                    # Weighted average of median home value
+                    if "acs_median_home_value" in reachable_temp.columns:
+                        weighted_home = (reachable_temp["acs_median_home_value"] * reachable_temp["acs_total_pop"]).sum(skipna=True)
+                        avg_home_value = weighted_home / total_reachable_pop if pd.notna(weighted_home) else None
+            
+            # Top metrics row - Population Reach
+            st.markdown("#### 👥 Population Reach")
+            pop_cols = st.columns(3)
+            with pop_cols[0]:
+                if total_reachable_pop > 0:
+                    st.metric("🎯 Total People Reachable", fmt_int(total_reachable_pop))
+                else:
+                    st.metric("🎯 Total People Reachable", "N/A")
+            with pop_cols[1]:
+                st.metric("📍 Districts in Radius", len(districts_in_radius) if not districts_in_radius.empty else 0)
+            with pop_cols[2]:
+                # Try to get county count too
+                try:
+                    county_shapes_count, _ = load_us_county_shapes()
+                    if not county_shapes_count.empty:
+                        county_shapes_count["distance_km"] = county_shapes_count.apply(
+                            lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
+                            axis=1
+                        )
+                        counties_in_rad = county_shapes_count[county_shapes_count["distance_km"] <= radius_km]
+                        st.metric("🏘️ Counties in Radius", len(counties_in_rad))
+                    else:
+                        st.metric("🏘️ Counties in Radius", "N/A")
+                except Exception:
+                    st.metric("🏘️ Counties in Radius", "N/A")
+            
+            # Cost of Living row
+            st.markdown("#### 💰 Cost of Living (Area Average)")
+            cost_cols = st.columns(4)
+            with cost_cols[0]:
+                if avg_median_income and pd.notna(avg_median_income):
+                    st.metric("Median HH Income", fmt_money(avg_median_income))
+                else:
+                    st.metric("Median HH Income", "N/A")
+            with cost_cols[1]:
+                if avg_median_rent and pd.notna(avg_median_rent):
+                    st.metric("Median Rent", fmt_money(avg_median_rent) + "/mo")
+                elif avg_median_income and pd.notna(avg_median_income):
+                    # Estimate rent if actual data not available
+                    est_rent = (avg_median_income / 12) * 0.30
+                    st.metric("Est. Rent (~30% income)", fmt_money(est_rent) + "/mo")
+                else:
+                    st.metric("Median Rent", "N/A")
+            with cost_cols[2]:
+                if avg_home_value and pd.notna(avg_home_value):
+                    st.metric("Median Home Value", fmt_money(avg_home_value))
+                else:
+                    st.metric("Median Home Value", "N/A")
+            with cost_cols[3]:
+                # Cost of living index (rough estimate: compare to national median ~$75k)
+                if avg_median_income and pd.notna(avg_median_income):
+                    national_median = 75000
+                    col_index = (avg_median_income / national_median) * 100
+                    st.metric("COL Index", f"{col_index:.0f}", help="100 = national average ($75k median income)")
+                else:
+                    st.metric("COL Index", "N/A")
+            
+            st.markdown("---")
+            
             # Create two columns for side-by-side display
             col_districts, col_counties = st.columns(2)
             
@@ -2657,7 +2791,6 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 st.markdown("#### 🗳️ Congressional Districts in Radius")
                 if not districts_in_radius.empty:
                     num_districts = len(districts_in_radius)
-                    st.metric("Districts Reachable", num_districts)
                     
                     # Show compact list of districts
                     district_list = districts_in_radius["district_id"].tolist()
@@ -2708,13 +2841,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                         
                         if not counties_in_radius.empty:
                             num_counties = len(counties_in_radius)
-                            total_pop = counties_in_radius["total_pop"].sum()
+                            total_county_pop = counties_in_radius["total_pop"].sum()
                             
-                            col_metric1, col_metric2 = st.columns(2)
-                            with col_metric1:
-                                st.metric("Counties", num_counties)
-                            with col_metric2:
-                                st.metric("Total Pop.", fmt_int(total_pop))
+                            st.caption(f"**{num_counties} counties** — Total pop: **{fmt_int(total_county_pop)}**")
                             
                             # Show top 10 counties by population
                             top_counties = counties_in_radius.nlargest(10, "total_pop")[["county_name", "state_po", "total_pop", "distance_km"]].copy()
@@ -2722,11 +2851,10 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                             top_counties["Population"] = top_counties["total_pop"].apply(fmt_int)
                             top_counties["Distance (km)"] = top_counties["distance_km"].apply(lambda v: f"{v:.1f}")
                             
-                            st.caption("**Top 10 by population:**")
                             st.dataframe(
                                 top_counties[["County", "Population", "Distance (km)"]].reset_index(drop=True),
                                 use_container_width=True,
-                                height=min(390, 35 + 35 * len(top_counties))
+                                height=min(350, 35 + 35 * len(top_counties))
                             )
                             
                             # Full list in expander
