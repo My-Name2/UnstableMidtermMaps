@@ -1152,6 +1152,8 @@ def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
     normalized to the form ``"ST-N"`` or ``"ST-AL"`` matching the rest of
     the application.  The function caches its result to avoid re-reading
     shapefiles on every run.
+    
+    Geometries are simplified to reduce file size and improve rendering speed.
     """
     url = CD_ZIPS.get(year)
     if not url:
@@ -1211,6 +1213,14 @@ def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
         gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
         pass
+    
+    # PERFORMANCE: Simplify geometries to reduce rendering load
+    # tolerance=0.01 degrees (~1km) provides good balance of speed vs detail
+    try:
+        gdf["geometry"] = gdf.geometry.simplify(tolerance=0.01, preserve_topology=True)
+    except Exception:
+        pass
+    
     # Compute centroids (lat/lon) for each district for later distance calculations.
     try:
         gdf["centroid_lat"] = gdf.geometry.centroid.y
@@ -1270,6 +1280,14 @@ def load_us_county_shapes(cache_dir: str = "county_shapes_cache"):
         gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
         pass
+    
+    # PERFORMANCE: Simplify geometries to reduce rendering load
+    # tolerance=0.005 degrees (~500m) for counties (smaller than districts)
+    try:
+        gdf["geometry"] = gdf.geometry.simplify(tolerance=0.005, preserve_topology=True)
+    except Exception:
+        pass
+    
     # Compute centroids (lat/lon) for travel calculations
     try:
         gdf["centroid_lat"] = gdf.geometry.centroid.y
@@ -2461,20 +2479,27 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     overlay_data = {}
                     colormap = None
                 
-                # Create the map centered on current location
+                # Pre-compute which districts are within radius and selected for faster style lookup
+                districts_within = set(temp[temp["distance_km"] <= radius_km]["district_id"].tolist())
+                districts_selected = set(selected_districts)
+                
+                # Create the map centered on current location with performance options
                 m = folium.Map(
                     location=[lat, lon],
                     zoom_start=6,
-                    tiles="CartoDB positron"
+                    tiles="CartoDB positron",
+                    prefer_canvas=True,  # PERFORMANCE: Use canvas rendering instead of SVG
+                    zoom_control=True,
+                    scrollWheelZoom=True,
+                    dragging=True
                 )
                 
-                # Style function for districts
+                # Style function for districts - optimized with pre-computed sets
                 def style_function(feature):
                     did = feature['properties'].get('district_id', '')
                     val = overlay_data.get(did, None)
-                    within = temp[temp["district_id"] == did]["distance_km"].values
-                    is_within = len(within) > 0 and within[0] <= radius_km
-                    is_selected = did in selected_districts
+                    is_within = did in districts_within
+                    is_selected = did in districts_selected
                     
                     if val is not None and colormap:
                         fill_color = colormap(val)
@@ -2500,11 +2525,20 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 ).add_to(m)
                 
                 # Add district name labels if toggle is enabled
+                # PERFORMANCE: Only add labels for districts within extended radius to reduce markers
                 if show_district_labels:
-                    for idx, row in us_gdf.iterrows():
+                    # Show labels for districts within 2x the travel radius (or minimum 500km)
+                    label_radius_km = max(radius_km * 2, 500)
+                    nearby_districts = temp[temp["distance_km"] <= label_radius_km]
+                    
+                    for idx, row in nearby_districts.iterrows():
                         did = row.get("district_id", "")
-                        clat = row.get("centroid_lat", np.nan)
-                        clon = row.get("centroid_lon", np.nan)
+                        # Get centroid from us_gdf
+                        gdf_row = us_gdf[us_gdf["district_id"] == did]
+                        if gdf_row.empty:
+                            continue
+                        clat = gdf_row.iloc[0].get("centroid_lat", np.nan)
+                        clon = gdf_row.iloc[0].get("centroid_lon", np.nan)
                         if did and pd.notna(clat) and pd.notna(clon):
                             folium.Marker(
                                 [clat, clon],
