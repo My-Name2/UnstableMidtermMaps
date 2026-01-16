@@ -2529,23 +2529,23 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 if show_district_labels:
                     # Show labels for districts within 2x the travel radius (or minimum 500km)
                     label_radius_km = max(radius_km * 2, 500)
-                    nearby_districts = temp[temp["distance_km"] <= label_radius_km]
+                    nearby_districts = temp[temp["distance_km"] <= label_radius_km]["district_id"].tolist()
                     
-                    for idx, row in nearby_districts.iterrows():
-                        did = row.get("district_id", "")
+                    for did in nearby_districts:
                         # Get centroid from us_gdf
-                        gdf_row = us_gdf[us_gdf["district_id"] == did]
-                        if gdf_row.empty:
+                        gdf_match = us_gdf[us_gdf["district_id"] == did]
+                        if gdf_match.empty:
                             continue
-                        clat = gdf_row.iloc[0].get("centroid_lat", np.nan)
-                        clon = gdf_row.iloc[0].get("centroid_lon", np.nan)
+                        gdf_row = gdf_match.iloc[0]
+                        clat = gdf_row["centroid_lat"] if "centroid_lat" in gdf_row.index else np.nan
+                        clon = gdf_row["centroid_lon"] if "centroid_lon" in gdf_row.index else np.nan
                         if did and pd.notna(clat) and pd.notna(clon):
                             folium.Marker(
                                 [clat, clon],
                                 icon=folium.DivIcon(
-                                    html=f'<div style="font-size: 9px; font-weight: bold; color: #333; text-shadow: 1px 1px 1px white, -1px -1px 1px white, 1px -1px 1px white, -1px 1px 1px white; white-space: nowrap;">{did}</div>',
-                                    icon_size=(50, 15),
-                                    icon_anchor=(25, 7)
+                                    html=f'<div style="font-size: 10px; font-weight: bold; color: #000; background: rgba(255,255,255,0.7); padding: 1px 3px; border-radius: 2px; white-space: nowrap;">{did}</div>',
+                                    icon_size=(60, 18),
+                                    icon_anchor=(30, 9)
                                 )
                             ).add_to(m)
                 
