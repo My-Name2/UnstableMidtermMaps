@@ -619,6 +619,7 @@ ACS_OUTPUT_COLS = [
     "acs_pct_male",
     "acs_pct_female",
     "acs_median_age",
+    "acs_pct_college_age",
     "acs_pct_white_alone",
     "acs_pct_black_alone",
     "acs_pct_asian_alone",
@@ -640,6 +641,7 @@ ACS_LABELS = {
     "acs_pct_male": "% male",
     "acs_pct_female": "% female",
     "acs_median_age": "Median age",
+    "acs_pct_college_age": "% college age (18-24)",
     "acs_pct_white_alone": "% White (alone)",
     "acs_pct_black_alone": "% Black (alone)",
     "acs_pct_asian_alone": "% Asian (alone)",
@@ -788,6 +790,14 @@ def resolve_acs_profile_varmap(acs_year: int):
     varmap["acs_median_age"] = (
         _pick_var_code(vars_meta, False, ["median age"], [])
         or _pick_var_code(vars_meta, False, ["estimate", "median age"], [])
+    )
+
+    # College-age population (18-24 years)
+    # ACS has various age bracket variables - we look for 18-24 or similar
+    varmap["acs_pct_college_age"] = (
+        _pick_var_code(vars_meta, True, ["percent", "18 to 24"], [])
+        or _pick_var_code(vars_meta, True, ["percent", "18", "24"], ["under"])
+        or _pick_var_code(vars_meta, True, ["percent", "20 to 24"], [])  # fallback to narrower range
     )
 
     varmap["acs_pct_white_alone"] = (
@@ -2106,70 +2116,114 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             help="Display congressional district IDs directly on the map"
         )
 
-        # Starting location selection
-        # Use Streamlit session state to persist the chosen starting location across
-        # reruns.  If not yet defined, initialize to a default central US point.
-        if "travel_lat" not in st.session_state:
-            st.session_state["travel_lat"] = 39.5
-        if "travel_lon" not in st.session_state:
-            st.session_state["travel_lon"] = -98.35
+        # Starting location selection - MULTIPLE POINTS SUPPORTED
+        # Use Streamlit session state to persist starting locations across reruns.
+        # Each point is stored as a dict with 'lat', 'lon', 'name' keys.
+        if "travel_points" not in st.session_state:
+            # Initialize with one default point
+            st.session_state["travel_points"] = [
+                {"lat": 39.5, "lon": -98.35, "name": "Center US"}
+            ]
         if "listening_for_click" not in st.session_state:
             st.session_state["listening_for_click"] = False
         if "map_key_counter" not in st.session_state:
             st.session_state["map_key_counter"] = 0
+        if "active_point_index" not in st.session_state:
+            st.session_state["active_point_index"] = 0
 
         st.markdown("---")
         
-        # Location controls in a compact row
-        st.markdown("### 📍 Starting Location")
+        # Location controls
+        st.markdown("### 📍 Starting Locations (Multiple Points)")
+        st.caption("Add multiple starting points to see combined travel coverage. Each point gets its own travel radius.")
         
-        # Row 1: Main action buttons
-        col_btn1, col_btn2, col_search_box, col_go = st.columns([1.2, 1.2, 2, 0.8])
+        # Display current points in a table-like format
+        travel_points = st.session_state.get("travel_points", [])
         
-        with col_btn1:
+        if travel_points:
+            st.markdown("**Current Starting Points:**")
+            for i, pt in enumerate(travel_points):
+                county_name = find_county_at_point(pt["lat"], pt["lon"])
+                col_num, col_info, col_actions = st.columns([0.5, 3, 1.5])
+                with col_num:
+                    # Color indicator for each point
+                    colors = ["🟢", "🔵", "🟣", "🟠", "🔴", "🟡", "⚪", "🟤"]
+                    st.markdown(f"**{colors[i % len(colors)]} {i+1}**")
+                with col_info:
+                    display_name = pt.get("name", f"Point {i+1}")
+                    if county_name:
+                        st.caption(f"{display_name}: ({pt['lat']:.4f}, {pt['lon']:.4f}) — {county_name}")
+                    else:
+                        st.caption(f"{display_name}: ({pt['lat']:.4f}, {pt['lon']:.4f})")
+                with col_actions:
+                    col_del, col_edit = st.columns(2)
+                    with col_del:
+                        if len(travel_points) > 1:  # Keep at least one point
+                            if st.button("🗑️", key=f"del_pt_{i}", help="Remove this point"):
+                                st.session_state["travel_points"].pop(i)
+                                if st.session_state["active_point_index"] >= len(st.session_state["travel_points"]):
+                                    st.session_state["active_point_index"] = max(0, len(st.session_state["travel_points"]) - 1)
+                                st.session_state["map_key_counter"] += 1
+                                st.rerun()
+                    with col_edit:
+                        if st.button("✏️", key=f"edit_pt_{i}", help="Edit this point"):
+                            st.session_state["active_point_index"] = i
+        
+        st.markdown("---")
+        
+        # Add new point controls
+        st.markdown("**Add New Starting Point:**")
+        col_method = st.columns([1, 1, 1])
+        
+        with col_method[0]:
             is_listening = st.session_state.get("listening_for_click", False)
-            if st.button("🎯 Click Map to Set" if not is_listening else "❌ Cancel", 
+            if st.button("🎯 Click Map to Add" if not is_listening else "❌ Cancel", 
                         type="primary" if not is_listening else "secondary", 
                         use_container_width=True):
                 st.session_state["listening_for_click"] = not is_listening
                 st.session_state["map_key_counter"] += 1
                 st.rerun()
         
-        with col_btn2:
-            if st.button("🔄 Reset Center", use_container_width=True):
-                st.session_state["travel_lat"] = 39.5
-                st.session_state["travel_lon"] = -98.35
+        with col_method[1]:
+            if st.button("🔄 Clear All Points", use_container_width=True):
+                st.session_state["travel_points"] = [{"lat": 39.5, "lon": -98.35, "name": "Center US"}]
+                st.session_state["active_point_index"] = 0
                 st.session_state["listening_for_click"] = False
                 st.session_state["map_key_counter"] += 1
                 st.rerun()
         
+        with col_method[2]:
+            max_points = 8
+            if len(travel_points) >= max_points:
+                st.caption(f"Max {max_points} points")
+        
+        # Search to add a point
+        col_search_box, col_go = st.columns([3, 1])
         with col_search_box:
             search_query = st.text_input(
-                "Search location",
+                "Search location to add",
                 key="travel_location_search",
                 placeholder="City, address, or ZIP...",
                 label_visibility="collapsed"
             )
-        
         with col_go:
-            if st.button("🔍", key="travel_search_button", use_container_width=True):
-                if search_query:
+            if st.button("🔍 Add", key="travel_search_button", use_container_width=True):
+                if search_query and len(travel_points) < 8:
                     coords = geocode_location(search_query)
                     if coords:
-                        st.session_state["travel_lat"], st.session_state["travel_lon"] = coords
+                        new_point = {"lat": coords[0], "lon": coords[1], "name": search_query[:30]}
+                        st.session_state["travel_points"].append(new_point)
                         st.session_state["listening_for_click"] = False
                         st.session_state["map_key_counter"] += 1
                         st.rerun()
                     else:
                         st.warning("Location not found")
         
-        # Row 2: County selector (alternative method that always works)
-        with st.expander("🏘️ Or select a county to center on", expanded=False):
+        # County selector to add a point
+        with st.expander("🏘️ Or select a county to add", expanded=False):
             try:
-                # Load county data for the selector
                 county_shapes_for_select, _ = load_us_county_shapes()
                 if not county_shapes_for_select.empty:
-                    # Build county options: "County, ST"
                     county_shapes_for_select["county_label"] = county_shapes_for_select["county_name"] + ", " + county_shapes_for_select["state_po"]
                     county_shapes_for_select = county_shapes_for_select.sort_values("county_label")
                     county_options = [""] + county_shapes_for_select["county_label"].tolist()
@@ -2185,34 +2239,26 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                             placeholder="Type to search counties..."
                         )
                     with col_set_county:
-                        if st.button("📍 Go to County", use_container_width=True, disabled=not selected_county):
+                        can_add = selected_county and len(travel_points) < 8
+                        if st.button("📍 Add County", use_container_width=True, disabled=not can_add):
                             if selected_county:
                                 county_row = county_shapes_for_select[county_shapes_for_select["county_label"] == selected_county].iloc[0]
-                                st.session_state["travel_lat"] = float(county_row["centroid_lat"])
-                                st.session_state["travel_lon"] = float(county_row["centroid_lon"])
+                                new_point = {
+                                    "lat": float(county_row["centroid_lat"]),
+                                    "lon": float(county_row["centroid_lon"]),
+                                    "name": selected_county[:30]
+                                }
+                                st.session_state["travel_points"].append(new_point)
                                 st.session_state["listening_for_click"] = False
                                 st.session_state["map_key_counter"] += 1
                                 st.rerun()
             except Exception as e:
                 st.caption(f"County selector unavailable: {str(e)[:50]}")
         
-        # Show current location and listening status
-        current_lat = st.session_state.get("travel_lat", 39.5)
-        current_lon = st.session_state.get("travel_lon", -98.35)
+        # Show listening status
         is_listening = st.session_state.get("listening_for_click", False)
-        
-        # Look up the county name for the current location (using fast helper)
-        current_county_name = find_county_at_point(current_lat, current_lon)
-        current_county_display = f" — **{current_county_name}**" if current_county_name else ""
-        
         if is_listening:
-            st.warning("👆 **Click anywhere on the map below to set your starting location!**")
-        else:
-            st.success(f"📍 Current location: ({current_lat:.4f}, {current_lon:.4f}){current_county_display}")
-        
-        # Use current session state values
-        lat = current_lat
-        lon = current_lon
+            st.warning("👆 **Click anywhere on the map below to add a new starting point!**")
         
         st.markdown("---")
 
@@ -2443,6 +2489,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
 
         # Build and display the travel map figure
         if not us_gdf.empty:
+            # Get all travel points
+            travel_points = st.session_state.get("travel_points", [{"lat": 39.5, "lon": -98.35, "name": "Center US"}])
+            
             # Compute distances and travel times for each district
             speed_map = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
             speed_kmh = speed_map.get(transport_mode, 96.56064)
@@ -2451,11 +2500,25 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             
             # Include district FIPS for display in summary tables
             temp = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
-            temp["distance_km"] = temp.apply(
-                lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
-                axis=1,
-            )
+            
+            # For multiple points, compute minimum distance to ANY point
+            def min_distance_to_points(row):
+                min_dist = float('inf')
+                for pt in travel_points:
+                    dist = _haversine(pt["lat"], pt["lon"], row["centroid_lat"], row["centroid_lon"])
+                    if dist < min_dist:
+                        min_dist = dist
+                return min_dist
+            
+            temp["distance_km"] = temp.apply(min_distance_to_points, axis=1)
             temp["travel_minutes"] = (temp["distance_km"] / speed_kmh) * 60.0
+            
+            # Use first point as map center, or average of all points
+            if travel_points:
+                center_lat = sum(pt["lat"] for pt in travel_points) / len(travel_points)
+                center_lon = sum(pt["lon"] for pt in travel_points) / len(travel_points)
+            else:
+                center_lat, center_lon = 39.5, -98.35
             
             # ----------------------------------------------------------------
             # UNIFIED MAP: Use Folium if available (clickable), else Plotly
@@ -2479,16 +2542,16 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     overlay_data = {}
                     colormap = None
                 
-                # Pre-compute which districts are within radius and selected for faster style lookup
+                # Pre-compute which districts are within radius of ANY point
                 districts_within = set(temp[temp["distance_km"] <= radius_km]["district_id"].tolist())
                 districts_selected = set(selected_districts)
                 
-                # Create the map centered on current location with performance options
+                # Create the map centered on average of all points
                 m = folium.Map(
-                    location=[lat, lon],
-                    zoom_start=6,
+                    location=[center_lat, center_lon],
+                    zoom_start=5 if len(travel_points) > 1 else 6,
                     tiles="CartoDB positron",
-                    prefer_canvas=True,  # PERFORMANCE: Use canvas rendering instead of SVG
+                    prefer_canvas=True,
                     zoom_control=True,
                     scrollWheelZoom=True,
                     dragging=True
@@ -2525,9 +2588,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 ).add_to(m)
                 
                 # Add district name labels if toggle is enabled
-                # PERFORMANCE: Only add labels for districts within extended radius to reduce markers
                 if show_district_labels:
-                    # Show labels for districts within 2x the travel radius (or minimum 500km)
                     label_radius_km = max(radius_km * 2, 500)
                     nearby_districts = temp[temp["distance_km"] <= label_radius_km]["district_id"].tolist()
                     
@@ -2549,34 +2610,45 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                                 )
                             ).add_to(m)
                 
-                # Add the travel radius circle
-                folium.Circle(
-                    [lat, lon],
-                    radius=radius_m,
-                    color="#009900",
-                    weight=3,
-                    fill=True,
-                    fill_color="#00ff00",
-                    fill_opacity=0.1,
-                    popup=f"{time_minutes} min {transport_mode.lower()} radius"
-                ).add_to(m)
+                # Colors for multiple points
+                point_colors = ["green", "blue", "purple", "orange", "red", "cadetblue", "darkgreen", "darkred"]
+                circle_colors = ["#009900", "#0066cc", "#9933cc", "#ff9900", "#cc0000", "#5f9ea0", "#006400", "#8b0000"]
                 
-                # Find which county the starting point is in (using fast helper)
-                starting_county_name = find_county_at_point(lat, lon)
-                
-                # Add starting point marker
-                folium.Marker(
-                    [lat, lon],
-                    popup=f"Start: ({lat:.4f}, {lon:.4f})" + (f"<br>{starting_county_name}" if starting_county_name else ""),
-                    icon=folium.Icon(color="green", icon="star")
-                ).add_to(m)
-                
-                # Add county name label below the marker
-                if starting_county_name:
+                # Add travel radius circles and markers for EACH starting point
+                for i, pt in enumerate(travel_points):
+                    pt_lat, pt_lon = pt["lat"], pt["lon"]
+                    pt_name = pt.get("name", f"Point {i+1}")
+                    pt_color = point_colors[i % len(point_colors)]
+                    circle_color = circle_colors[i % len(circle_colors)]
+                    
+                    # Add the travel radius circle for this point
+                    folium.Circle(
+                        [pt_lat, pt_lon],
+                        radius=radius_m,
+                        color=circle_color,
+                        weight=3,
+                        fill=True,
+                        fill_color=circle_color,
+                        fill_opacity=0.08,
+                        popup=f"{pt_name}: {time_minutes} min {transport_mode.lower()} radius"
+                    ).add_to(m)
+                    
+                    # Find county for this point
+                    pt_county = find_county_at_point(pt_lat, pt_lon)
+                    
+                    # Add marker for this starting point
                     folium.Marker(
-                        [lat - 0.15, lon],  # Slightly below the marker
+                        [pt_lat, pt_lon],
+                        popup=f"<b>{pt_name}</b><br>({pt_lat:.4f}, {pt_lon:.4f})" + (f"<br>{pt_county}" if pt_county else ""),
+                        icon=folium.Icon(color=pt_color, icon="star")
+                    ).add_to(m)
+                    
+                    # Add label below marker with point number and county
+                    label_text = f"{i+1}. {pt_county}" if pt_county else f"{i+1}. {pt_name}"
+                    folium.Marker(
+                        [pt_lat - 0.15, pt_lon],
                         icon=folium.DivIcon(
-                            html=f'<div style="font-size: 12px; font-weight: bold; color: #006400; background: rgba(255,255,255,0.85); padding: 3px 8px; border-radius: 4px; border: 1px solid #009900; white-space: nowrap; text-align: center;">📍 {starting_county_name}</div>',
+                            html=f'<div style="font-size: 11px; font-weight: bold; color: {circle_color}; background: rgba(255,255,255,0.9); padding: 2px 6px; border-radius: 4px; border: 2px solid {circle_color}; white-space: nowrap; text-align: center;">📍 {label_text}</div>',
                             icon_size=(200, 30),
                             icon_anchor=(100, 0)
                         )
@@ -2587,7 +2659,6 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     colormap.add_to(m)
                 
                 # Add a LatLngPopup to capture clicks anywhere on the map
-                # This works even when clicking on GeoJSON layers
                 from folium.plugins import MousePosition
                 MousePosition().add_to(m)
                 
@@ -2597,10 +2668,10 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 # Add instruction overlay if listening
                 if is_listening:
                     folium.Marker(
-                        [lat + 3, lon],
+                        [center_lat + 3, center_lon],
                         icon=folium.DivIcon(
-                            html='<div style="font-size: 16px; color: red; font-weight: bold; background: white; padding: 5px; border-radius: 5px; border: 2px solid red;">👆 CLICK ANYWHERE ON MAP - coordinates will appear in popup</div>',
-                            icon_size=(400, 40)
+                            html='<div style="font-size: 16px; color: red; font-weight: bold; background: white; padding: 5px; border-radius: 5px; border: 2px solid red;">👆 CLICK ANYWHERE ON MAP to add a new starting point</div>',
+                            icon_size=(450, 40)
                         )
                     ).add_to(m)
                 
@@ -2618,7 +2689,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 if is_listening:
                     st.caption(f"🔍 Debug - Map data: last_clicked={map_data.get('last_clicked') if map_data else None}")
                 
-                # Handle click if listening - try multiple sources
+                # Handle click if listening - ADD a new point
                 clicked_coords = None
                 if map_data:
                     if map_data.get("last_clicked"):
@@ -2626,9 +2697,15 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     elif map_data.get("last_object_clicked"):
                         clicked_coords = (map_data["last_object_clicked"]["lat"], map_data["last_object_clicked"]["lng"])
                 
-                if is_listening and clicked_coords:
-                    st.session_state["travel_lat"] = clicked_coords[0]
-                    st.session_state["travel_lon"] = clicked_coords[1]
+                if is_listening and clicked_coords and len(travel_points) < 8:
+                    # Add as a new point
+                    county_name = find_county_at_point(clicked_coords[0], clicked_coords[1])
+                    new_point = {
+                        "lat": clicked_coords[0],
+                        "lon": clicked_coords[1],
+                        "name": county_name if county_name else f"Point {len(travel_points)+1}"
+                    }
+                    st.session_state["travel_points"].append(new_point)
                     st.session_state["listening_for_click"] = False
                     st.session_state["map_key_counter"] += 1
                     st.rerun()
@@ -2636,30 +2713,37 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 # Alternative: Manual coordinate entry when clicking doesn't work
                 if is_listening:
                     st.markdown("---")
-                    st.markdown("**📍 Or enter coordinates manually from the popup:**")
+                    st.markdown("**📍 Or enter coordinates manually to add a point:**")
                     col_lat_manual, col_lon_manual, col_set = st.columns([1, 1, 1])
                     with col_lat_manual:
-                        manual_lat = st.number_input("Latitude from popup", value=lat, format="%.6f", key="manual_lat_input")
+                        manual_lat = st.number_input("Latitude", value=center_lat, format="%.6f", key="manual_lat_input")
                     with col_lon_manual:
-                        manual_lon = st.number_input("Longitude from popup", value=lon, format="%.6f", key="manual_lon_input")
+                        manual_lon = st.number_input("Longitude", value=center_lon, format="%.6f", key="manual_lon_input")
                     with col_set:
                         st.markdown("<br>", unsafe_allow_html=True)
-                        if st.button("✅ Set This Location", type="primary", use_container_width=True):
-                            st.session_state["travel_lat"] = manual_lat
-                            st.session_state["travel_lon"] = manual_lon
-                            st.session_state["listening_for_click"] = False
-                            st.session_state["map_key_counter"] += 1
-                            st.rerun()
+                        if st.button("✅ Add This Point", type="primary", use_container_width=True):
+                            if len(travel_points) < 8:
+                                county_name = find_county_at_point(manual_lat, manual_lon)
+                                new_point = {
+                                    "lat": manual_lat,
+                                    "lon": manual_lon,
+                                    "name": county_name if county_name else f"Point {len(travel_points)+1}"
+                                }
+                                st.session_state["travel_points"].append(new_point)
+                                st.session_state["listening_for_click"] = False
+                                st.session_state["map_key_counter"] += 1
+                                st.rerun()
             
             else:
-                # Fallback to Plotly map (no click support)
+                # Fallback to Plotly map (no click support) - use first point
+                first_pt = travel_points[0] if travel_points else {"lat": 39.5, "lon": -98.35}
                 fig_travel = make_travel_map_figure(
                     year,
                     overlay_type,
                     transport_mode,
                     time_minutes,
-                    lat,
-                    lon,
+                    first_pt["lat"],
+                    first_pt["lon"],
                     selected_districts,
                     year_data[year]["dist_df"],
                     us_gdf,
