@@ -2375,6 +2375,12 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
         # running.
         if overlay_type == "County population heatmap" and enable_acs:
             try:
+                # Get travel points for multi-point support
+                travel_points = st.session_state.get("travel_points", [{"lat": 39.5, "lon": -98.35, "name": "Center US"}])
+                # Use first point for the combined map (Plotly doesn't support multi-point well)
+                first_pt = travel_points[0] if travel_points else {"lat": 39.5, "lon": -98.35}
+                lat, lon = first_pt["lat"], first_pt["lon"]
+                
                 # Load county shapes and population estimates
                 county_shapes, county_geojson = load_us_county_shapes()
                 # Use the newest available ACS 5‑year population estimate: try 2023, then 2022
@@ -2387,7 +2393,17 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 )
                 # Load district shapes for overlay boundaries and FIPS codes
                 us_gdf, us_geojson = load_us_cd_shapes(year)
-                # Build combined map with highlighted districts
+                
+                # For multi-point: compute min distance to any point
+                def min_dist_to_points(row):
+                    min_d = float('inf')
+                    for pt in travel_points:
+                        d = _haversine(pt["lat"], pt["lon"], row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan))
+                        if d < min_d:
+                            min_d = d
+                    return min_d
+                
+                # Build combined map with highlighted districts (uses first point for center)
                 fig_combined = make_county_district_combined_map(
                     overlay_type,
                     transport_mode,
@@ -2408,10 +2424,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 temp_c = county_df[[
                     "county_id", "county_name", "state_po", "centroid_lat", "centroid_lon", "total_pop", "total_pop_moe"
                 ]].copy()
-                temp_c["distance_km"] = temp_c.apply(
-                    lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
-                    axis=1,
-                )
+                # Use min distance to any travel point
+                temp_c["distance_km"] = temp_c.apply(min_dist_to_points, axis=1)
                 temp_c["travel_minutes"] = (temp_c["distance_km"] / speed_kmh) * 60.0
                 temp_c["within_radius"] = temp_c["distance_km"] <= radius_km
                 disp_c = temp_c[temp_c["within_radius"] == True].copy()
@@ -2441,12 +2455,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     agg_df_c = pd.DataFrame([agg_metrics])
                     st.dataframe(agg_df_c, use_container_width=True, height=100)
                 # ----- District summary -----
-                # Compute travel distances for all districts
+                # Compute travel distances for all districts (min distance to any point)
                 temp_d = us_gdf[["district_id", "district_fips", "centroid_lat", "centroid_lon"]].copy()
-                temp_d["distance_km"] = temp_d.apply(
-                    lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)),
-                    axis=1,
-                )
+                temp_d["distance_km"] = temp_d.apply(min_dist_to_points, axis=1)
                 temp_d["travel_minutes"] = (temp_d["distance_km"] / speed_kmh) * 60.0
                 temp_d["within_radius"] = temp_d["distance_km"] <= radius_km
                 temp_d["selected"] = temp_d["district_id"].isin(selected_districts)
