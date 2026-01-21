@@ -1341,10 +1341,8 @@ def find_county_at_point(lat: float, lon: float) -> str:
 @st.cache_data(show_spinner=True)
 def load_county_population(acs_year: int, api_key: str | None = None):
     """
-    Fetch ACS 5‑year total population estimates for all counties for a given
-    year.  We request both the estimate (B01003_001E) and the associated
-    margin of error (B01003_001M).  Results are returned as a DataFrame
-    keyed by the county's 5‑digit FIPS code.
+    Fetch ACS 5‑year total population estimates and age demographics for all 
+    counties for a given year. Includes college-age (18-24) population data.
 
     Parameters
     ----------
@@ -1358,10 +1356,20 @@ def load_county_population(acs_year: int, api_key: str | None = None):
     Returns
     -------
     pandas.DataFrame
-        Columns: county_id, state, county, total_pop, total_pop_moe, acs_year.
+        Columns: county_id, state, county, total_pop, total_pop_moe, 
+                 pop_18_24, pct_college_age, acs_year.
     """
     # Build API URL and parameters
-    vars_ = ["B01003_001E", "B01003_001M"]
+    # B01003_001E = Total population
+    # B01003_001M = Total population MOE
+    # Age brackets from B01001 (Sex by Age):
+    # B01001_007E = Male 18-19, B01001_008E = Male 20, B01001_009E = Male 21, B01001_010E = Male 22-24
+    # B01001_031E = Female 18-19, B01001_032E = Female 20, B01001_033E = Female 21, B01001_034E = Female 22-24
+    vars_ = [
+        "B01003_001E", "B01003_001M",  # Total pop
+        "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",  # Male 18-24
+        "B01001_031E", "B01001_032E", "B01001_033E", "B01001_034E",  # Female 18-24
+    ]
     get_params = ",".join(vars_)
     base_url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5"
     params = {
@@ -1386,8 +1394,20 @@ def load_county_population(acs_year: int, api_key: str | None = None):
     df["county_id"] = df["state"] + df["county"]
     df["total_pop"] = pd.to_numeric(df["B01003_001E"], errors="coerce")
     df["total_pop_moe"] = pd.to_numeric(df["B01003_001M"], errors="coerce")
+    
+    # Calculate college-age population (18-24)
+    age_cols = ["B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",
+                "B01001_031E", "B01001_032E", "B01001_033E", "B01001_034E"]
+    for col in age_cols:
+        df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
+    df["pop_18_24"] = df[age_cols].sum(axis=1)
+    
+    # Calculate percentage
+    df["pct_college_age"] = (df["pop_18_24"] / df["total_pop"] * 100).round(1)
+    df.loc[df["total_pop"] == 0, "pct_college_age"] = 0
+    
     df["acs_year"] = acs_year
-    return df[["county_id", "state", "county", "total_pop", "total_pop_moe", "acs_year"]]
+    return df[["county_id", "state", "county", "total_pop", "total_pop_moe", "pop_18_24", "pct_college_age", "acs_year"]]
 
 # ============================
 # NEW: Travel map figure builder
@@ -1780,6 +1800,7 @@ def make_county_district_combined_map(
     district_gdf: gpd.GeoDataFrame,
     district_geojson: dict,
     selected_districts: list[str],
+    travel_points: list[dict] = None,
 ):
     """
     Build a Plotly figure that overlays county‑level population choropleth
@@ -1787,8 +1808,8 @@ def make_county_district_combined_map(
     total population estimate from the ACS 5‑year dataset.  District
     boundaries are drawn on top: all districts are shown with thin grey
     outlines while any user‑selected districts are highlighted with a
-    semi‑transparent fill and thicker border.  A travel radius circle and
-    starting point marker are also drawn.
+    semi‑transparent fill and thicker border.  Travel radius circles and
+    starting point markers are drawn for each travel point.
 
     This function is used when the user chooses the "County population
     heatmap" overlay while still desiring to see congressional district
@@ -1805,7 +1826,7 @@ def make_county_district_combined_map(
     time_minutes : int
         Travel duration in minutes.
     lat, lon : float
-        Coordinates of the user‑specified starting point.
+        Coordinates of the first starting point (legacy, used if travel_points not provided).
     county_df : GeoDataFrame
         Counties with columns `county_id`, `total_pop`, `centroid_lat`,
         `centroid_lon` and geometry.
@@ -1818,6 +1839,9 @@ def make_county_district_combined_map(
         GeoJSON representation of districts.
     selected_districts : list[str]
         District identifiers selected by the user for highlighting.
+    travel_points : list[dict], optional
+        List of travel point dicts with 'lat', 'lon', 'name' keys.
+        If not provided, uses single lat/lon.
 
     Returns
     -------
@@ -1827,16 +1851,28 @@ def make_county_district_combined_map(
     # Guard: if county or district data is missing, return empty figure
     if county_df.empty or district_gdf.empty:
         return go.Figure()
+    
+    # Build travel_points list if not provided
+    if travel_points is None or len(travel_points) == 0:
+        travel_points = [{"lat": lat, "lon": lon, "name": "Start"}]
+    
     gdf_county = county_df.copy()
     gdf_dist = district_gdf.copy()
     # Compute speed and radius
     speeds = {"Driving": 96.56064, "Walking": 4.82803, "Cycling": 24.14016}
     speed_kmh = speeds.get(transport_mode, 96.56064)
     radius_km = float(speed_kmh) * (time_minutes / 60.0)
-    # Compute distances and reachable flag for counties
-    gdf_county["distance_km"] = gdf_county.apply(
-        lambda row: _haversine(lat, lon, row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan)), axis=1
-    )
+    
+    # Compute minimum distance to any travel point for counties
+    def min_dist_to_points(row):
+        min_d = float('inf')
+        for pt in travel_points:
+            d = _haversine(pt["lat"], pt["lon"], row.get("centroid_lat", np.nan), row.get("centroid_lon", np.nan))
+            if d < min_d:
+                min_d = d
+        return min_d
+    
+    gdf_county["distance_km"] = gdf_county.apply(min_dist_to_points, axis=1)
     gdf_county["within_radius"] = gdf_county["distance_km"] <= radius_km
     # Colour scale for county population
     overlay_vals = gdf_county.get("total_pop", pd.Series([np.nan] * len(gdf_county), index=gdf_county.index))
@@ -1910,45 +1946,66 @@ def make_county_district_combined_map(
         )
     else:
         highlight_trace = None
-    # Travel radius circle
-    if np.isfinite(radius_km) and radius_km > 0 and np.isfinite(lat) and np.isfinite(lon):
-        num_points = 360
-        angles = np.linspace(0, 2 * np.pi, num_points)
-        deg_lat = radius_km / 111.32
-        deg_lon = radius_km / (111.32 * np.cos(np.radians(lat)) if np.cos(np.radians(lat)) != 0 else 1.0)
-        circle_lats = lat + deg_lat * np.sin(angles)
-        circle_lons = lon + deg_lon * np.cos(angles)
-        circle_trace = go.Scattergeo(
-            lat=circle_lats,
-            lon=circle_lons,
-            mode="lines",
-            line=dict(color="#009900", width=2),
-            name="Travel radius",
-            hoverinfo="skip",
+    
+    # Colors for multiple points
+    point_colors = ["#009900", "#0066cc", "#9933cc", "#ff9900", "#cc0000", "#5f9ea0", "#006400", "#8b0000"]
+    marker_symbols = ["star", "diamond", "square", "triangle-up", "circle", "pentagon", "hexagon", "octagon"]
+    
+    # Create circle and marker traces for EACH travel point
+    circle_traces = []
+    marker_traces = []
+    
+    for i, pt in enumerate(travel_points):
+        pt_lat, pt_lon = pt["lat"], pt["lon"]
+        pt_name = pt.get("name", f"Point {i+1}")
+        pt_color = point_colors[i % len(point_colors)]
+        pt_symbol = marker_symbols[i % len(marker_symbols)]
+        
+        # Travel radius circle for this point
+        if np.isfinite(radius_km) and radius_km > 0 and np.isfinite(pt_lat) and np.isfinite(pt_lon):
+            num_points = 360
+            angles = np.linspace(0, 2 * np.pi, num_points)
+            deg_lat = radius_km / 111.32
+            deg_lon = radius_km / (111.32 * np.cos(np.radians(pt_lat)) if np.cos(np.radians(pt_lat)) != 0 else 1.0)
+            circle_lats = pt_lat + deg_lat * np.sin(angles)
+            circle_lons = pt_lon + deg_lon * np.cos(angles)
+            circle_trace = go.Scattergeo(
+                lat=circle_lats,
+                lon=circle_lons,
+                mode="lines",
+                line=dict(color=pt_color, width=2),
+                name=f"Radius {i+1}",
+                hoverinfo="skip",
+                showlegend=False,
+            )
+            circle_traces.append(circle_trace)
+        
+        # Starting point marker for this point
+        marker_trace = go.Scattergeo(
+            lat=[pt_lat],
+            lon=[pt_lon],
+            mode="markers+text",
+            marker=dict(size=12, color=pt_color, symbol=pt_symbol, line=dict(width=1, color="white")),
+            text=[str(i+1)],
+            textposition="top center",
+            textfont=dict(size=10, color=pt_color),
+            name=pt_name,
+            hovertext=f"{i+1}. {pt_name}",
+            hoverinfo="text",
             showlegend=False,
         )
-    else:
-        circle_trace = None
-    # Starting point marker
-    marker_trace = go.Scattergeo(
-        lat=[lat],
-        lon=[lon],
-        mode="markers",
-        marker=dict(size=8, color="#000000", symbol="x"),
-        name="Starting point",
-        hovertext="Starting point",
-        hoverinfo="text",
-        showlegend=False,
-    )
+        marker_traces.append(marker_trace)
+    
     # Assemble figure
     fig = go.Figure()
     fig.add_trace(county_trace)
     fig.add_trace(base_trace)
     if highlight_trace is not None:
         fig.add_trace(highlight_trace)
-    if circle_trace is not None:
-        fig.add_trace(circle_trace)
-    fig.add_trace(marker_trace)
+    for ct in circle_traces:
+        fig.add_trace(ct)
+    for mt in marker_traces:
+        fig.add_trace(mt)
     fig.update_layout(
         title_text="US Counties & Congressional Districts — Travel Canvas",
         geo=dict(
@@ -2389,7 +2446,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 except Exception:
                     county_pop = load_county_population(2022, None)
                 county_df = county_shapes.merge(
-                    county_pop[["county_id", "total_pop", "total_pop_moe"]], on="county_id", how="left"
+                    county_pop[["county_id", "total_pop", "total_pop_moe", "pop_18_24", "pct_college_age"]], on="county_id", how="left"
                 )
                 # Load district shapes for overlay boundaries and FIPS codes
                 us_gdf, us_geojson = load_us_cd_shapes(year)
@@ -2403,7 +2460,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                             min_d = d
                     return min_d
                 
-                # Build combined map with highlighted districts (uses first point for center)
+                # Build combined map with highlighted districts and all travel points
                 fig_combined = make_county_district_combined_map(
                     overlay_type,
                     transport_mode,
@@ -2415,6 +2472,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     us_gdf,
                     us_geojson,
                     selected_districts,
+                    travel_points=travel_points,
                 )
                 st.plotly_chart(fig_combined, use_container_width=True)
                 # ----- County summary -----
@@ -2422,7 +2480,8 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 speed_kmh = speed_map.get(transport_mode, 96.56064)
                 radius_km = float(speed_kmh) * (time_minutes / 60.0)
                 temp_c = county_df[[
-                    "county_id", "county_name", "state_po", "centroid_lat", "centroid_lon", "total_pop", "total_pop_moe"
+                    "county_id", "county_name", "state_po", "centroid_lat", "centroid_lon", 
+                    "total_pop", "total_pop_moe", "pop_18_24", "pct_college_age"
                 ]].copy()
                 # Use min distance to any travel point
                 temp_c["distance_km"] = temp_c.apply(min_dist_to_points, axis=1)
@@ -2434,14 +2493,16 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 disp_c["Distance (km)"] = disp_c["distance_km"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "")
                 disp_c["Travel time (min)"] = disp_c["travel_minutes"].apply(lambda v: f"{v:.0f}" if pd.notna(v) else "")
                 disp_c["Population"] = disp_c["total_pop"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
-                disp_c["Population MOE"] = disp_c["total_pop_moe"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
-                cols = ["County", "Distance (km)", "Travel time (min)", "Population", "Population MOE"]
+                disp_c["College Age (18-24)"] = disp_c["pop_18_24"].apply(lambda v: fmt_int(v) if pd.notna(v) else "")
+                disp_c["% College Age"] = disp_c["pct_college_age"].apply(lambda v: f"{v:.1f}%" if pd.notna(v) else "")
+                cols = ["County", "Distance (km)", "Travel time (min)", "Population", "College Age (18-24)", "% College Age"]
                 if not disp_c.empty:
                     disp_c = disp_c.sort_values("travel_minutes")
                     st.markdown("**Reachable counties**")
                     st.dataframe(disp_c[cols].reset_index(drop=True), use_container_width=True, height=320)
                 # Aggregated population for reachable counties
                 reach_pop_total = temp_c.loc[temp_c["within_radius"] == True, "total_pop"].sum(skipna=True)
+                reach_college_total = temp_c.loc[temp_c["within_radius"] == True, "pop_18_24"].sum(skipna=True)
                 reach_moe_total = np.sqrt(
                     np.square(
                         temp_c.loc[temp_c["within_radius"] == True, "total_pop_moe"].astype(float)
@@ -2449,9 +2510,12 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                 ) if ("total_pop_moe" in temp_c.columns and not temp_c["total_pop_moe"].isna().all()) else np.nan
                 if pd.notna(reach_pop_total) and reach_pop_total > 0:
                     agg_metrics = {"Total population": fmt_int(reach_pop_total)}
+                    if pd.notna(reach_college_total):
+                        agg_metrics["College Age (18-24)"] = fmt_int(reach_college_total)
+                        agg_metrics["% College Age"] = f"{(reach_college_total / reach_pop_total * 100):.1f}%"
                     if pd.notna(reach_moe_total):
-                        agg_metrics["Margin of error"] = fmt_int(reach_moe_total)
-                    st.markdown("**Aggregated population of reachable counties**")
+                        agg_metrics["Pop. Margin of Error"] = fmt_int(reach_moe_total)
+                    st.markdown("**Aggregated demographics of reachable counties**")
                     agg_df_c = pd.DataFrame([agg_metrics])
                     st.dataframe(agg_df_c, use_container_width=True, height=100)
                 # ----- District summary -----
