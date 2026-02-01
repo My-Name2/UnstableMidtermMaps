@@ -70,8 +70,16 @@ CD_ZIPS = {
     2020: "https://www2.census.gov/geo/tiger/GENZ2018/shp/cb_2018_us_cd116_500k.zip",
     2022: "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_cd118_500k.zip",
     2024: "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_cd118_500k.zip",
+    2026: "https://www2.census.gov/geo/tiger/GENZ2024/shp/cb_2024_us_cd119_500k.zip",  # ADD THIS
 }
-
+CD_SESSION = {
+    2016: "116",
+    2018: "116", 
+    2020: "116",
+    2022: "118",
+    2024: "118",
+    2026: "119",
+}
 # ----------------------------
 # COUNTY SHAPES (Census cartographic boundary)
 #
@@ -1112,10 +1120,14 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 
     gdf = gpd.read_file(f"zip://{zip_path}")
 
+    session = CD_SESSION.get(year, "118")
+    cd_col_name = f"CD{session}FP"
     cols_upper = {str(c).upper(): c for c in gdf.columns}
     cd_candidates = []
+    if cd_col_name.upper() in cols_upper:
+        cd_candidates.append(cols_upper[cd_col_name.upper()])
     for u, orig in cols_upper.items():
-        if u.startswith("CD") and u.endswith("FP"):
+        if u.startswith("CD") and u.endswith("FP") and orig not in cd_candidates:
             cd_candidates.append(orig)
     if not cd_candidates:
         cd_candidates = [c for c in gdf.columns if re.match(r"^CD\d+FP$", str(c).strip(), flags=re.I)]
@@ -3151,7 +3163,7 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
     if enable_acs:
         acs_used_year, acs_cd, acs_state, acs_tried, acs_errors, acs_var_notes = load_acs_with_fallback(int(acs_requested_year), census_api_key)
 
-    YEARS = [2016, 2018, 2020, 2022, 2024]
+    YEARS = [2016, 2018, 2020, 2022, 2024, 2026]
     year_data = {}
 
     for y in YEARS:
@@ -3463,7 +3475,7 @@ war_path = st.sidebar.text_input("WAR CSV path", value=default_war)
 
 st.sidebar.divider()
 
-YEARS = [2016, 2018, 2020, 2022, 2024]
+YEARS = [2016, 2018, 2020, 2022, 2024, 2026]
 year = st.sidebar.radio("Year", YEARS, index=0)
 metric_label = st.sidebar.radio("State map colors", ["Pres margin", "Avg House margin"], index=0)
 metric_col = "pres_margin" if metric_label == "Pres margin" else "avg_house_margin"
