@@ -1,5 +1,3 @@
-
-
 # ============================================
 # STREAMLIT APP: US Elections Explorer
 # - Years: 2016 / 2018 / 2020 / 2022 / 2024
@@ -1324,6 +1322,60 @@ def load_current_cd_shapes():
     
     geojson = json.loads(gdf.to_json())
     return gdf, geojson
+
+
+@st.cache_data(show_spinner=True)
+def load_current_state_cd_shapes(state_po: str):
+    """
+    Load the CURRENT congressional district shapes for a specific state from the CD119 TopoJSON.
+    Returns (geojson, gdf) to match the signature of load_state_cd_geojson.
+    """
+    state_po = state_po.upper().strip()
+    if state_po not in STATE_FIPS:
+        raise ValueError(f"Unknown state_po: {state_po}")
+    
+    stfp = STATE_FIPS[state_po]
+    
+    p = Path(CD119_TOPOJSON_PATH)
+    if not p.exists():
+        raise FileNotFoundError(f"CD119 TopoJSON file not found: {CD119_TOPOJSON_PATH}")
+    
+    gdf = gpd.read_file(p)
+    if gdf.empty:
+        raise ValueError("No geometries found in TopoJSON")
+    
+    # Filter to the selected state
+    gdf = gdf[gdf["STATEFP"].astype(str).str.zfill(2) == stfp].copy()
+    if gdf.empty:
+        raise ValueError(f"No geometries for state {state_po}")
+    
+    # Find the district column (CD119FP)
+    cols_upper = {str(c).upper(): c for c in gdf.columns}
+    cd_col = None
+    for pattern in ["CD119FP", "CD118FP", "CD116FP"]:
+        if pattern in cols_upper:
+            cd_col = cols_upper[pattern]
+            break
+    if not cd_col:
+        for u, orig in cols_upper.items():
+            if u.startswith("CD") and u.endswith("FP"):
+                cd_col = orig
+                break
+    
+    if not cd_col:
+        raise ValueError(f"TopoJSON missing district column. Found: {list(gdf.columns)}")
+    
+    gdf[cd_col] = gdf[cd_col].astype(str).str.zfill(2)
+    gdf["district_id"] = gdf[cd_col].map(lambda fp: f"{state_po}-AL" if fp in ("00", "ZZ") else f"{state_po}-{int(fp)}")
+    gdf = gdf[gdf.geometry.notna()].copy()
+    
+    try:
+        gdf["geometry"] = gdf.geometry.buffer(0)
+    except Exception:
+        pass
+    
+    geojson = json.loads(gdf.to_json())
+    return geojson, gdf
 
 
 # ============================
@@ -3419,7 +3471,8 @@ def make_state_map_figure(sdf, year, metric_col):
     return fig
 
 def make_district_map_figure(state_po, year, sub, spend_measure: str, include_acs: bool):
-    geojson, gdf = load_state_cd_geojson(year, state_po)
+    # Always use current CD119 district boundaries
+    geojson, gdf = load_current_state_cd_shapes(state_po)
 
     if spend_measure == "Disbursements":
         dem_sp = "fec_disburse_democrat"
