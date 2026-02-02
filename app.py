@@ -40,7 +40,7 @@ try:
     FOLIUM_AVAILABLE = True
 except ImportError:
     FOLIUM_AVAILABLE = False
-CD119_TOPOJSON_PATH = "tl_2025_US_cd119_redistricted_TX_CA_topo.json"
+CD119_TOPOJSON_PATH = "tl_2025_US_cd119_redistricted_TX_CA.topo.json"
 # ----------------------------
 # CONFIG
 # ----------------------------
