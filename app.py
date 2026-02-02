@@ -1254,6 +1254,78 @@ def load_us_cd_shapes(year: int, cache_dir: str = "district_shapes_cache"):
     geojson = json.loads(gdf.to_json())
     return gdf, geojson
 
+
+@st.cache_data(show_spinner=True)
+def load_current_cd_shapes():
+    """
+    Load the CURRENT congressional district shapes from the CD119 TopoJSON file.
+    This is used by the Travel Canvas to always show the latest redistricted boundaries.
+    """
+    p = Path(CD119_TOPOJSON_PATH)
+    if not p.exists():
+        raise FileNotFoundError(f"CD119 TopoJSON file not found: {CD119_TOPOJSON_PATH}")
+    
+    gdf = gpd.read_file(p)
+    if gdf.empty:
+        raise ValueError("No geometries found in TopoJSON")
+    
+    # Find the district column (CD119FP)
+    cols_upper = {str(c).upper(): c for c in gdf.columns}
+    cd_col = None
+    for pattern in ["CD119FP", "CD118FP", "CD116FP"]:
+        if pattern in cols_upper:
+            cd_col = cols_upper[pattern]
+            break
+    if not cd_col:
+        for u, orig in cols_upper.items():
+            if u.startswith("CD") and u.endswith("FP"):
+                cd_col = orig
+                break
+    
+    if not cd_col or "STATEFP" not in gdf.columns:
+        raise ValueError(f"TopoJSON missing required columns. Found: {list(gdf.columns)}")
+    
+    gdf[cd_col] = gdf[cd_col].astype(str).str.zfill(2)
+    
+    def mk_id(row):
+        stfp = str(row["STATEFP"]).zfill(2)
+        state_po = FIPS_TO_STATE.get(stfp, "")
+        if not state_po:
+            return None
+        fp = row[cd_col]
+        if fp == "ZZ":
+            return f"{state_po}-ZZ"
+        return f"{state_po}-AL" if fp == "00" else f"{state_po}-{int(fp)}"
+    
+    gdf["district_id"] = gdf.apply(mk_id, axis=1)
+    gdf = gdf[gdf["district_id"].notna() & gdf.geometry.notna()].copy()
+    
+    try:
+        gdf["district_fips"] = gdf["STATEFP"].astype(str).str.zfill(2) + gdf[cd_col].astype(str).str.zfill(2)
+    except Exception:
+        gdf["district_fips"] = ""
+    
+    try:
+        gdf["geometry"] = gdf.geometry.buffer(0)
+    except Exception:
+        pass
+    
+    try:
+        gdf["geometry"] = gdf.geometry.simplify(tolerance=0.01, preserve_topology=True)
+    except Exception:
+        pass
+    
+    try:
+        gdf["centroid_lat"] = gdf.geometry.centroid.y
+        gdf["centroid_lon"] = gdf.geometry.centroid.x
+    except Exception:
+        gdf["centroid_lat"] = np.nan
+        gdf["centroid_lon"] = np.nan
+    
+    geojson = json.loads(gdf.to_json())
+    return gdf, geojson
+
+
 # ============================
 # NEW: County shapes loader and ACS population loader
 # ============================
@@ -2461,7 +2533,7 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
                     county_pop[["county_id", "total_pop", "total_pop_moe", "pop_18_24", "pct_college_age"]], on="county_id", how="left"
                 )
                 # Load district shapes for overlay boundaries and FIPS codes
-                us_gdf, us_geojson = load_us_cd_shapes(year)
+                us_gdf, us_geojson = load_current_cd_shapes()
                 
                 # For multi-point: compute min distance to any point
                 def min_dist_to_points(row):
@@ -2566,9 +2638,9 @@ def render_travel_canvas(year: int, year_data: dict, enable_acs: bool):
             # Exit early after handling the combined county/district overlay
             return
 
-        # Load full US district shapes for the selected year
+        # Load full US district shapes (always use current CD119 boundaries)
         try:
-            us_gdf, us_geojson = load_us_cd_shapes(year)
+            us_gdf, us_geojson = load_current_cd_shapes()
         except Exception as e:
             st.error(f"Unable to load US district shapes for year {year}.")
             st.exception(e)
@@ -3163,7 +3235,7 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
     if enable_acs:
         acs_used_year, acs_cd, acs_state, acs_tried, acs_errors, acs_var_notes = load_acs_with_fallback(int(acs_requested_year), census_api_key)
 
-    YEARS = [2016, 2018, 2020, 2022, 2024, 2026]
+    YEARS = [2016, 2018, 2020, 2022, 2024]
     year_data = {}
 
     for y in YEARS:
@@ -3475,7 +3547,7 @@ war_path = st.sidebar.text_input("WAR CSV path", value=default_war)
 
 st.sidebar.divider()
 
-YEARS = [2016, 2018, 2020, 2022, 2024, 2026]
+YEARS = [2016, 2018, 2020, 2022, 2024]
 year = st.sidebar.radio("Year", YEARS, index=0)
 metric_label = st.sidebar.radio("State map colors", ["Pres margin", "Avg House margin"], index=0)
 metric_col = "pres_margin" if metric_label == "Pres margin" else "avg_house_margin"
@@ -3529,17 +3601,8 @@ if enable_acs:
             st.write(line)
 sdf = year_data[year]["state_df"]
 if sdf.empty:
-    if year == 2026:
-        st.info("**2026 Preview Mode** — No election data yet. Use the Travel Canvas above to explore the new CD119 redistricted district boundaries!")
-        states = sorted(STATE_FIPS.keys())
-        state_po = st.sidebar.selectbox("State", states, index=0)
-        st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024 / 2026)")
-        st.subheader("📍 2026 CD119 Districts — Use Travel Canvas above")
-        st.write("The 2026 election hasn't happened yet. Select **Travel Map / Canvas** tab above to explore the new congressional district boundaries.")
-        st.stop()
-    else:
-        st.error("No state-level data for the selected year.")
-        st.stop()
+    st.error("No state-level data for the selected year.")
+    st.stop()
 
 states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s)==2])
 state_po = st.sidebar.selectbox("State", states, index=0)
@@ -3548,7 +3611,7 @@ state_po = st.sidebar.selectbox("State", states, index=0)
 # ----------------------------
 # MAIN UI
 # ----------------------------
-st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024 / 2026)")
+st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024)")
 
 left, right = st.columns([1.15, 1.0], gap="large")
 
