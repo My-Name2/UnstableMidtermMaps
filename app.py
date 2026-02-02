@@ -3527,19 +3527,28 @@ if enable_acs:
     with st.sidebar.expander("ACS variables resolved (debug)"):
         for line in (acs_var_notes or []):
             st.write(line)
-
 sdf = year_data[year]["state_df"]
 if sdf.empty:
-    st.error("No state-level data for the selected year.")
-    st.stop()
+    if year == 2026:
+        st.info("**2026 Preview Mode** — No election data yet. Use the Travel Canvas above to explore the new CD119 redistricted district boundaries!")
+        states = sorted(STATE_FIPS.keys())
+        state_po = st.sidebar.selectbox("State", states, index=0)
+        st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024 / 2026)")
+        st.subheader("📍 2026 CD119 Districts — Use Travel Canvas above")
+        st.write("The 2026 election hasn't happened yet. Select **Travel Map / Canvas** tab above to explore the new congressional district boundaries.")
+        st.stop()
+    else:
+        st.error("No state-level data for the selected year.")
+        st.stop()
 
 states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s)==2])
 state_po = st.sidebar.selectbox("State", states, index=0)
 
+
 # ----------------------------
 # MAIN UI
 # ----------------------------
-st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024)")
+st.title("US Elections Explorer (2016 / 2018 / 2020 / 2022 / 2024 / 2026)")
 
 left, right = st.columns([1.15, 1.0], gap="large")
 
