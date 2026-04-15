@@ -271,10 +271,18 @@ def cand_join(names):
     names = sorted(set(names))
     return " / ".join(names[:3]) if names else ""
 
-def party_simple_from_fec(party_str: str):
-    p = (party_str or "").strip().lower()
-    if "democrat" in p: return "DEMOCRAT"
-    if "republican" in p: return "REPUBLICAN"
+def party_simple_from_fec(party_str):
+    if pd.isna(party_str):
+        return ""
+
+    p = str(party_str).strip().lower()
+    if not p:
+        return ""
+
+    if "democrat" in p:
+        return "DEMOCRAT"
+    if "republican" in p:
+        return "REPUBLICAN"
     return ""
 
 def district_code_to_id(code):
