@@ -277,18 +277,46 @@ def party_simple_from_fec(party_str: str):
     if "republican" in p: return "REPUBLICAN"
     return ""
 
-def district_code_to_id(code: str):
-    s = (code or "").strip().upper()
+def district_code_to_id(code):
+    # Handle missing values first
+    if pd.isna(code):
+        return ""
+
+    # Excel often gives district codes as floats like 7.0 or 0.0
+    if isinstance(code, (int, np.integer)):
+        val = int(code)
+        return "AL" if val == 0 else f"{val:02d}"
+
+    if isinstance(code, (float, np.floating)):
+        if not np.isfinite(code):
+            return ""
+        if float(code).is_integer():
+            val = int(code)
+            return "AL" if val == 0 else f"{val:02d}"
+        return ""
+
+    s = str(code).strip().upper()
+    if not s:
+        return ""
+
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", "", s)
+
+    if s.isdigit():
+        val = int(s)
+        return "AL" if val == 0 else f"{val:02d}"
+
+    if s in {"AL", "ATLARGE", "AT-LARGE", "AT_LARGE", "00"}:
+        return "AL"
+
     m = re.match(r"^([A-Z]{2})-(\d{1,2}|00|AL)$", s)
-    if not m:
-        return ""
-    st, d = m.group(1), m.group(2)
-    if d in ("AL", "00"):
-        return f"{st}-AL"
-    try:
-        return f"{st}-{int(d)}"
-    except Exception:
-        return ""
+    if m:
+        d = m.group(2)
+        if d in {"AL", "00"}:
+            return "AL"
+        return f"{int(d):02d}"
+
+    return ""
 
 def normalize_geo_to_district_id(geo: str) -> str:
     s = (geo or "").strip().upper()
@@ -481,6 +509,7 @@ def load_inputs(pres_path, house_path):
 # LOAD FEC SPENDING (EXCEL)
 # ----------------------------
 @st.cache_data(show_spinner=True)
+@st.cache_data(show_spinner=True)
 def load_fec_spending(spend_xlsx_path: str):
     if not spend_xlsx_path:
         return pd.DataFrame(), pd.DataFrame()
@@ -493,14 +522,24 @@ def load_fec_spending(spend_xlsx_path: str):
 
     df["cycle_year"] = pd.to_numeric(df.get("cycle_year", np.nan), errors="coerce")
     df["state_po"] = df.get("state_abbrev", "").astype(str).str.strip().str.upper()
-    df["district_id"] = df.get("district_code", "").astype(str).apply(district_code_to_id)
+
+    district_series = df["district_code"] if "district_code" in df.columns else pd.Series(index=df.index, dtype="object")
+    district_norm = district_series.apply(district_code_to_id)
+
+    df["district_id"] = np.where(
+        district_norm.eq(""),
+        "",
+        df["state_po"].fillna("").astype(str).str.strip().str.upper() + "-" + district_norm
+    )
+
     df["party_simple"] = df.get("party", "").astype(str).apply(party_simple_from_fec)
 
     for c in ["receipts", "disbursements", "cash_on_hand", "debts"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # District totals across all parties
+    df = df[df["district_id"].astype(str).str.len() > 0].copy()
+
     dist_all = (
         df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]]
           .sum()
@@ -508,7 +547,6 @@ def load_fec_spending(spend_xlsx_path: str):
           .rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
     )
 
-    # District totals for Dem/Rep only
     maj = df[df["party_simple"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
     if maj.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -531,7 +569,6 @@ def load_fec_spending(spend_xlsx_path: str):
 
     spend_dist = piv.merge(dist_all, on=["cycle_year", "state_po", "district_id"], how="left")
 
-    # Ensure expected columns exist even if one party is missing in a district
     for c in ["fec_receipts_democrat", "fec_receipts_republican", "fec_disburse_democrat", "fec_disburse_republican"]:
         if c not in spend_dist.columns:
             spend_dist[c] = 0.0
@@ -548,7 +585,6 @@ def load_fec_spending(spend_xlsx_path: str):
         / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
     )
 
-    # State totals (sum across districts)
     spend_state = (
         spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
             [
